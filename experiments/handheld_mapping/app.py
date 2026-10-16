@@ -23,7 +23,7 @@ class MappingWindow(QWidget):
     """촬영 상태를 표시하고 blocking 작업을 session thread에 맡기는 노트북 제어창."""
 
     def __init__(self, session: Session, output_root: Path | None = None, demo: bool = False,
-                 imu_calibration: Path | None = None) -> None:
+                 imu_calibration: Path | None = None, inertial_fusion: bool = False) -> None:
         super().__init__()
         self.session = session
         self.close_pending = False
@@ -69,6 +69,13 @@ class MappingWindow(QWidget):
         self.imu_enabled.setChecked(calibration.expanduser().is_file() and not demo)
         self.imu_enabled.setToolTip("raw·보정 IMU를 원본 영상과 같은 폴더에 저장합니다. ORB 융합과 시계 동기화는 검증되지 않았습니다.")
         self.imu_calibration = QLineEdit(str(calibration))
+        self.inertial_fusion = QCheckBox('종료 후 IMU 융합 시험')
+        self.inertial_fusion.setToolTip('촬영 중에는 기존 stereo를 사용하고 종료 후 시간 정렬·관성 지도를 별도로 계산합니다.')
+        self.inertial_fusion.setChecked(inertial_fusion and not demo)
+        if self.inertial_fusion.isChecked():
+            self.imu_enabled.setChecked(True)
+        self.inertial_fusion.toggled.connect(lambda checked: self.imu_enabled.setChecked(True) if checked else None)
+        self.imu_enabled.toggled.connect(lambda checked: self.inertial_fusion.setChecked(False) if not checked else None)
         self.imu_zero_button = QPushButton('평지 영점')
         self.imu_zero_button.setToolTip('알려진 평지에서 3초 정지한 뒤 누르세요. IMU 참고 각도의 표시 영점만 설정하며 지도와 센서 보정값은 바꾸지 않습니다.')
         self.imu_zero_button.clicked.connect(self.zero_imu_display)
@@ -92,6 +99,7 @@ class MappingWindow(QWidget):
         fields.addWidget(self.imu_calibration, 7, 1)
         fields.addWidget(self.imu_zero_button,7,2)
         fields.addWidget(self.gravity_enabled,8,1)
+        fields.addWidget(self.inertial_fusion,9,1)
         self.choose_button = choose
         layout.addLayout(fields)
         self.status_label = QLabel("준비 · 시작 버튼을 누르세요")
@@ -165,6 +173,7 @@ class MappingWindow(QWidget):
                                 "live_mapping": self.live_mapping.isChecked(),
                                 "imu_enabled": self.imu_enabled.isChecked() and not self.demo.isChecked(),
                                 "gravity_enabled":self.gravity_enabled.isChecked(),
+                                "inertial_fusion":self.inertial_fusion.isChecked() and not self.demo.isChecked(),
                                 "imu_calibration": self.imu_calibration.text().strip()})
         except Exception as error:
             self.status_label.setText(str(error))
@@ -238,7 +247,9 @@ class MappingWindow(QWidget):
         self.sensors_only.setEnabled(not active and self.point_ready)
         self.live_mapping.setEnabled(not active and self.point_ready)
         if self.demo.isChecked():
+            self.inertial_fusion.setChecked(False)
             self.imu_enabled.setChecked(False)
+        self.inertial_fusion.setEnabled(not active and not self.demo.isChecked())
         self.imu_enabled.setEnabled(not active and not self.demo.isChecked())
         self.imu_calibration.setEnabled(not active and not self.demo.isChecked())
         if not self.imu_enabled.isChecked() or self.demo.isChecked():
@@ -266,7 +277,14 @@ class MappingWindow(QWidget):
             imu_text += f" · 중력 기준 {len(gravity.get('maps',{}))}개 지도 / {gravity['status']}"
         elif self.gravity_enabled.isChecked():
             imu_text += ' · 중력 기준 준비: 촬영 시작 후 3초간 정지'
-        self.imu_status.setText(imu_text+" · ORB 융합 안 함 · 시계 동기화 미검증")
+        fusion_text = 'ORB 융합 안 함'
+        if status.get('inertial_warning'):
+            fusion_text = status['inertial_warning']
+        elif status.get('inertial_dense', {}).get('status') == 'complete':
+            fusion_text = 'IMU 융합 지도 저장'
+        elif self.inertial_fusion.isChecked():
+            fusion_text = '종료 후 IMU 융합 시험'
+        self.imu_status.setText(imu_text+' · '+fusion_text+' · 시계 동기화 미검증')
         live = self.session.live_snapshot()
         if live and live.get('body_attitude') and not live.get('stale') and live.get('tracking_state') == 2:
             body = live['body_attitude']
@@ -347,12 +365,13 @@ def main() -> None:
     parser.add_argument("--demo", action="store_true")
     parser.add_argument("--output-root", type=Path)
     parser.add_argument("--imu-calibration", type=Path)
+    parser.add_argument('--imu-fusion', action='store_true', help='종료 후 별도 IMU 시간 정렬·융합 시험 (IMU 기록 자동 활성화)')
     parser.add_argument("--auto-stop", type=float)
     parser.add_argument("--screenshot", type=Path)
     parser.add_argument("--quit-after-save", action="store_true")
     args = parser.parse_args()
     app = QApplication(sys.argv[:1])
-    window = MappingWindow(Session(), args.output_root, args.demo, args.imu_calibration)
+    window = MappingWindow(Session(), args.output_root, args.demo, args.imu_calibration, args.imu_fusion)
     signal.signal(signal.SIGINT, lambda *_: window.close())
     signal.signal(signal.SIGTERM, lambda *_: window.close())
     window.show()

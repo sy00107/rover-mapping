@@ -16,6 +16,7 @@ class DepthFilter:
     min_neighbours: int = 3
     temporal_neighbours: int = 2
     max_reference_age_s: float = 3.
+    surface_cleanup: bool = False
 
     def __post_init__(self):
         values = (self.min_depth_m, self.max_depth_m, self.absolute_tolerance_m,
@@ -24,13 +25,18 @@ class DepthFilter:
                 or self.absolute_tolerance_m <= 0 or self.quadratic_tolerance < 0
                 or self.max_reference_age_s <= 0 or type(self.min_neighbours) is not int
                 or not 1 <= self.min_neighbours <= 8 or type(self.temporal_neighbours) is not int
-                or not 0 <= self.temporal_neighbours <= 4):
+                or not 0 <= self.temporal_neighbours <= 4 or type(self.surface_cleanup) is not bool):
             raise ValueError('invalid depth filter settings')
 
     def metadata(self):
         return {'method': 'spatial_support_and_final_pose_multiview_v1', **asdict(self),
-                'fills_missing_depth': False, 'changes_raw': False,
-                'single_frame_fallback': 'spatial only when no nearby reference frame exists',
+                'fills_missing_depth': self.surface_cleanup, 'changes_raw': False,
+                'surface_cleanup_details': ({'smoothing': 'edge-preserving inverse-depth 5x5; blend 1.0 to 1.3m',
+                    'far_agreement_max_m': .045, 'far_reference_matches': 2,
+                    'hole_filling': 'enclosed single pixels; >=6 consistent neighbours and 2 measured references'}
+                    if self.surface_cleanup else None),
+                'single_frame_fallback': ('near <=1m only; far needs two references' if self.surface_cleanup
+                                          else 'spatial only when no nearby reference frame exists'),
                 'limitations': 'repeatable stereo errors can survive; pose error can reject real surfaces'}
 
 
@@ -55,20 +61,34 @@ def spatial_filter(depth: np.ndarray, scale: float, config: DepthFilter) -> tupl
             discontinuity |= available & (difference > tolerance*2)
     keep = valid & (support >= config.min_neighbours) & ~discontinuity
     result = np.where(keep, depth, 0).astype(np.uint16)
+    if config.surface_cleanup:
+        from experiments.handheld_mapping.surface_cleanup import smooth_far_depth
+        result = smooth_far_depth(result, scale, config.min_depth_m, config.max_depth_m)
     return result, {'range_valid_pixels': int(valid.sum()), 'spatial_kept_pixels': int(keep.sum())}
 
 
 def multiview_filter(depth: np.ndarray, info: dict, world_depth: np.ndarray,
                      references: list, config: DepthFilter) -> tuple[np.ndarray, dict]:
     """주변의 다른 프레임에서 실측 depth가 일치한 픽셀만 확인된 관측으로 남긴다."""
-    if not references:
-        return depth.copy(), {'reference_frames': 0, 'multiview_kept_pixels': int((depth > 0).sum())}
+    if not references and not config.surface_cleanup:
+        return depth.copy(), {'reference_frames': 0, 'multiview_kept_pixels': int((depth > 0).sum()),
+                              'supported_holes_filled': 0}
     scale = float(info['depth_scale_m'])
+    if not references:
+        result = depth.copy()
+        if config.surface_cleanup:
+            result[result.astype(np.float32)*scale > 1.] = 0
+        return result, {'reference_frames': 0, 'multiview_kept_pixels': int((result > 0).sum()),
+                        'supported_holes_filled': 0}
+    candidates = np.zeros(depth.shape, bool)
+    if config.surface_cleanup and len(references) >= 2:
+        from experiments.handheld_mapping.surface_cleanup import supported_hole_candidates
+        depth, candidates = supported_hole_candidates(depth, scale, config.max_depth_m)
     k = np.asarray(info['k'], float).reshape(3, 3)
     v, u = np.nonzero(depth)
     z = depth[v, u].astype(np.float64)*scale
     points = np.c_[(u-k[0, 2])*z/k[0, 0], (v-k[1, 2])*z/k[1, 1], z]
-    confirmed = np.zeros(len(z), bool)
+    matches = np.zeros(len(z), np.uint8)
     height, width = depth.shape
     for reference_depth, reference_pose in references:
         relative = np.linalg.inv(reference_pose) @ world_depth
@@ -82,10 +102,15 @@ def multiview_filter(depth: np.ndarray, info: dict, world_depth: np.ndarray,
         indices = np.flatnonzero(visible)
         measured = reference_depth[y[indices], x[indices]].astype(np.float64)*scale
         tolerance = config.absolute_tolerance_m+config.quadratic_tolerance*pz[indices]**2
-        confirmed[indices] |= (measured > 0) & (np.abs(measured-pz[indices]) <= tolerance)
+        if config.surface_cleanup:
+            tolerance = np.where(z[indices] > 1., np.minimum(tolerance, .045), tolerance)
+        matches[indices] += (measured > 0) & (np.abs(measured-pz[indices]) <= tolerance)
+    required = np.where(z > 1., 2, 1) if config.surface_cleanup else 1
+    confirmed = matches >= required
     result = np.zeros_like(depth)
     result[v[confirmed], u[confirmed]] = depth[v[confirmed], u[confirmed]]
-    return result, {'reference_frames': len(references), 'multiview_kept_pixels': int(confirmed.sum())}
+    return result, {'reference_frames': len(references), 'multiview_kept_pixels': int(confirmed.sum()),
+                    'supported_holes_filled': int(np.count_nonzero(candidates & (result > 0)))}
 
 
 def filtered_depths(run: Path, keyfile: Path, map_id: int, info: dict,
@@ -98,7 +123,7 @@ def filtered_depths(run: Path, keyfile: Path, map_id: int, info: dict,
     scale = float(info['depth_scale_m'])
     stats.update({'keyframes': 0, 'matched_frames': 0, 'range_valid_pixels': 0,
                   'spatial_kept_pixels': 0, 'multiview_kept_pixels': 0,
-                  'frames_without_reference': 0})
+                  'frames_without_reference': 0, 'supported_holes_filled': 0})
 
     def load():
         for row, frame, gap in matched_depths(run, keyfile, map_id, info['depth_frame']):
@@ -140,6 +165,7 @@ def filtered_depths(run: Path, keyfile: Path, map_id: int, info: dict,
                       abs(entry[1]['stamp_ns']-frame['stamp_ns']) <= config.max_reference_age_s*1e9]
         filtered, counts = multiview_filter(depth, info, pose, references, config)
         stats['multiview_kept_pixels'] += counts['multiview_kept_pixels']
+        stats['supported_holes_filled'] += counts['supported_holes_filled']
         stats['frames_without_reference'] += not references
         yield row, frame, gap, filtered
         if config.temporal_neighbours:

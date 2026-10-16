@@ -32,4 +32,4 @@ fi
 cd /dev/shm/rover_mapping_imu_bridge
 patch --batch --fuzz=0 --forward -p1 -i tee.patch
 exec env PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -u pi/common/udp_spi_bridge.py \
-  --hz 50 --max-lin 0.15 --max-ang 0.8 --telemetry-socket /dev/shm/rover-mapping-imu.sock'
+  --hz 50 --max-lin 0.45 --max-ang 0.8 --telemetry-socket /dev/shm/rover-mapping-imu.sock'

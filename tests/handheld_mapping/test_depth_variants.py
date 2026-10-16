@@ -104,6 +104,39 @@ def test_cli_build_only_never_opens_a_window(mixed_run, monkeypatch):
     assert (mixed_run/'depth_variants/orb/depth_1m/depth_variant.json').is_file()
 
 
+def test_cleanup_is_separate_cached_geometry_and_terrain_uses_the_same_filter(mixed_run):
+    from experiments.handheld_mapping.depth_filter import DepthFilter
+    from experiments.handheld_mapping.terrain_replay import replay
+    from experiments.handheld_mapping.terrain import GridSpec
+    # Three measured frames let far surfaces obtain two reference matches.
+    source = json.loads((mixed_run/'frames.jsonl').read_text().splitlines()[0])
+    records = []
+    depth = cv2.imread(str(mixed_run/source['path']), cv2.IMREAD_UNCHANGED)
+    for i in range(3):
+        row = {**source, 'stamp_ns': 1_000_000_000+i*100_000_000,
+               'path': f'raw/depth/{1_000_000_000+i*100_000_000}.png'}
+        cv2.imwrite(str(mixed_run/row['path']), depth)
+        records.append(json.dumps(row))
+    (mixed_run/'frames.jsonl').write_text('\n'.join(records)+'\n')
+    (mixed_run/'orb/map_0_keyframes.csv').write_text(
+        'map_id,keyframe_id,source_stamp,x,y,z,qx,qy,qz,qw\n'+
+        ''.join(f'0,{i},{1+i*.1:.1f},1,0,0,0,0,0,1\n' for i in range(3)))
+    before = {str(p): fingerprint(p) for p in (mixed_run/'raw/depth').glob('*.png')}
+    baseline = ensure_depth_variant(mixed_run, 2.)
+    baseline_hash = fingerprint(select_maps(baseline)[0][1])
+    clean = ensure_depth_variant(mixed_run, 2., surface_cleanup=True)
+    assert clean.name == 'depth_2m_clean' and clean != baseline
+    assert ensure_depth_variant(mixed_run, 2., surface_cleanup=True) == clean
+    assert fingerprint(select_maps(baseline)[0][1]) == baseline_hash
+    assert before == {name: fingerprint(Path(name)) for name in before}
+    dense = json.loads((clean/'dense/summary.json').read_text())
+    assert dense['maps'][0]['surface_cleanup']['new_faces_or_bridges'] is False
+    terrain = replay(mixed_run, mixed_run/'clean_terrain', 0, GridSpec((-5., 5., -5., 5.), .1),
+                     np.eye(4), depth_max=2., depth_filter=DepthFilter(max_depth_m=2., surface_cleanup=True))
+    assert terrain['depth_filter'] == dense['depth_filter']
+    assert terrain['depth_filter_stats'] == dense['maps'][0]['depth_filter_stats']
+
+
 def test_variant_can_load_its_own_terrain_and_snapshot_sources(terrain_run):
     # Reuse the known classified ramp fixture as a small independent variant layout.
     import shutil

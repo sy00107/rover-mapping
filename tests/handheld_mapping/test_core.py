@@ -189,3 +189,26 @@ def test_compressed_image_cannot_expand_past_declared_size():
     header = {"width": 2, "height": 2, "step": 2, "encoding": "mono8", "compression": "zlib"}
     with pytest.raises(ValueError):
         decode_image(header, zlib.compress(b"a"*1000000))
+
+
+def test_inertial_tsdf_requires_initialized_export_and_uses_separate_output(tmp_path):
+    from experiments.handheld_mapping.reconstruct import reconstruct
+    from experiments.handheld_mapping.viewer import select_maps
+    run=make_run(tmp_path/'run')
+    (run/'orb').rename(run/'orb_inertial')
+    (run/'orb_inertial/summary.json').write_text(json.dumps({'orb_fused':True,'exported_imu_initialized_maps':[0]}))
+    result=reconstruct(run, voxel_size=.025, backend='orb_inertial')
+    assert result['maps'][0]['mesh']=='dense_inertial/map_0_mesh.ply'
+    assert result['coordinate_system']=='ORB stereo-inertial map; gravity estimate unverified'
+    assert result['imu_clock_verified'] is False
+    assert not (run/'dense/summary.json').exists()
+    assert select_maps(run,backend='orb_inertial')[0][1]==run/'dense_inertial/map_0_mesh.ply'
+
+
+def test_uninitialized_inertial_map_is_not_presented_as_fused_tsdf(tmp_path):
+    from experiments.handheld_mapping.reconstruct import reconstruct
+    run=make_run(tmp_path/'run')
+    (run/'orb').rename(run/'orb_inertial')
+    (run/'orb_inertial/summary.json').write_text(json.dumps({'orb_fused':False,'exported_imu_initialized_maps':[]}))
+    with pytest.raises(ValueError,match='initialized'):
+        reconstruct(run,backend='orb_inertial')

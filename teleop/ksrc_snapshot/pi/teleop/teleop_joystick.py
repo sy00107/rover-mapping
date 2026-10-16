@@ -16,8 +16,10 @@ KSRC 스워브 로버용 화면 마우스 조이스틱 텔레옵.
 매핑 중 급회전을 줄이기 위해 패드/Q/E 회전 명령은 --max-ang 기준의 50%로 보낸다.
 
 두 패드 모두 마우스를 떼면 (0,0) 으로 돌아온다 -- "명령하지 않는 중" 이라는
-모호하지 않은 안전 상태다. 스페이스바를 누르거나 창 포커스를 잃으면 전부 즉시
-0 이 된다 (비상정지 / 알트탭 안전장치).
+모호하지 않은 안전 상태다. 스페이스바를 누르는 동안에는 --max-lin 기준
+1/2/3배 속도로 직진한다 (횡이동·회전 없음). 숫자 1/2/3 또는 화면 버튼으로
+배율을 선택하며 시작은 1배다. 스페이스바를 떼거나 창 포커스를 잃으면 정지한다.
+포커스가 돌아와도 스페이스바를 새로 눌러야 다시 직진한다.
 
 와이어 포맷 두 가지 (--format):
   ascii  -> "V <vx> <vy> <omega>\\n" 줄. STM32 펌웨어의 터미널 파서가 그대로
@@ -50,12 +52,14 @@ from common.nucleo_link import (TLM_FLAG_GATE_PENDING, TLM_FLAG_WATCHDOG,
 from joystick_math import (apply_deadzone, clamp_to_unit_circle, left_pad_to_linear,
                            lock_low_speed_direction, right_pad_to_angular, snap_to_axes)
 
-WIDTH, HEIGHT = 640, 380
+WIDTH, HEIGHT = 640, 450
 PAD_RADIUS = 100
 LEFT_CENTER = (170, 190)
 RIGHT_CENTER = (470, 190)
 GRAB_SLACK = 1.4  # click within radius*GRAB_SLACK of center still grabs the pad
 ROTATION_SPEED_SCALE = 0.5  # 패드와 Q/E의 회전 명령만 50%로 제한
+FORWARD_SPEED_CHOICES = (1, 2, 3)
+SPEED_BUTTON_RECTS = ((16, 334, 192, 32), (224, 334, 192, 32), (432, 334, 192, 32))
 
 
 class Pad:
@@ -210,40 +214,74 @@ def run(args):
 
     left_pad = Pad(LEFT_CENTER, PAD_RADIUS)
     right_pad = Pad(RIGHT_CENTER, PAD_RADIUS)
+    speed_buttons = [pygame.Rect(rect) for rect in SPEED_BUTTON_RECTS]
+    speed_keys = {pygame.K_1: 1, pygame.K_2: 2, pygame.K_3: 3,
+                  pygame.K_KP1: 1, pygame.K_KP2: 2, pygame.K_KP3: 3}
 
     period = 1.0 / args.rate
     next_send = time.monotonic()
     last_dir = None   # 직전에 내보낸 병진 방향 (저속 방향 고정용)
     running = True
+    forward_held = False
+    controls_focused = True
+    forward_multiplier = 1
 
     try:
         while running:
+            forward_released = False
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
                 elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                     running = False
-                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    if left_pad.contains(event.pos):
+                elif event.type == pygame.KEYDOWN and event.key in speed_keys:
+                    if controls_focused:
+                        forward_multiplier = speed_keys[event.key]
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
+                    if controls_focused and not getattr(event, "repeat", False):
+                        forward_held = True
+                elif event.type == pygame.KEYUP and event.key == pygame.K_SPACE:
+                    forward_held = False
+                    forward_released = True
+                    left_pad.release()
+                    right_pad.release()
+                    last_dir = None
+                elif (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
+                      and controls_focused):
+                    selected = next((mult for mult, rect in zip(FORWARD_SPEED_CHOICES, speed_buttons)
+                                     if rect.collidepoint(event.pos)), None)
+                    if selected is not None:
+                        forward_multiplier = selected
+                    elif left_pad.contains(event.pos):
                         left_pad.start_drag(event.pos)
                     elif right_pad.contains(event.pos):
                         right_pad.start_drag(event.pos)
                 elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                     left_pad.release()
                     right_pad.release()
-                elif event.type == pygame.MOUSEMOTION:
+                elif event.type == pygame.MOUSEMOTION and controls_focused:
                     if left_pad.dragging:
                         left_pad.update(event.pos)
                     if right_pad.dragging:
                         right_pad.update(event.pos)
-                elif event.type in (pygame.WINDOWFOCUSLOST, pygame.ACTIVEEVENT):
+                elif (event.type == pygame.WINDOWFOCUSLOST or
+                      (event.type == pygame.ACTIVEEVENT and not event.gain and
+                       event.state & (pygame.APPINPUTFOCUS | pygame.APPACTIVE))):
+                    controls_focused = False
+                    forward_held = False
                     left_pad.release()
                     right_pad.release()
+                    last_dir = None
+                elif (event.type == pygame.WINDOWFOCUSGAINED or
+                      (event.type == pygame.ACTIVEEVENT and event.gain and
+                       event.state & (pygame.APPINPUTFOCUS | pygame.APPACTIVE))):
+                    controls_focused = True
 
             keys = pygame.key.get_pressed()
-            if keys[pygame.K_SPACE]:
+            if forward_held:
                 left_pad.release()
                 right_pad.release()
+                last_dir = None
 
             dz = getattr(args, "deadzone", 0.0)
             lnx, lny = apply_deadzone(left_pad.nx, left_pad.ny, dz)
@@ -262,7 +300,9 @@ def run(args):
             else:
                 omega = 0.0
             omega *= ROTATION_SPEED_SCALE
-            if keys[pygame.K_SPACE]:
+            if forward_held:
+                vx, vy, omega = args.max_lin * forward_multiplier, 0.0, 0.0
+            if not controls_focused or forward_released or not running:
                 vx = vy = omega = 0.0
 
             now = time.monotonic()
@@ -308,9 +348,19 @@ def run(args):
                 screen.blit(text, (pad.center[0] - text.get_width() // 2, pad.center[1] + pad.radius + 10))
 
             readout = f"vx={vx:+.2f} m/s  vy={vy:+.2f} m/s  omega={omega:+.2f} rad/s"
-            help_text = "drag pads with mouse | Q/E rotate | space=stop | Esc=quit"
+            help_text = "Space: hold forward / release stop | Q/E rotate | Esc quit"
             screen.blit(font.render(readout, True, (220, 220, 230)), (16, 16))
             screen.blit(font.render(help_text, True, (140, 140, 150)), (16, 44))
+            for mult, rect in zip(FORWARD_SPEED_CHOICES, speed_buttons):
+                selected = mult == forward_multiplier
+                pygame.draw.rect(screen, (35, 115, 155) if selected else (55, 55, 65), rect,
+                                 border_radius=5)
+                label = font.render(f"{mult}x   {args.max_lin * mult:.2f} m/s", True,
+                                    (245, 245, 250) if selected else (170, 170, 180))
+                screen.blit(label, label.get_rect(center=rect.center))
+            speed_text = (f"Space speed: {forward_multiplier}x ({args.max_lin * forward_multiplier:.2f} m/s)"
+                          " | 1 / 2 / 3 or click")
+            screen.blit(font.render(speed_text, True, (160, 210, 235)), (16, 380))
             if tlm_mode:
                 if last_tlm is not None:
                     c = last_tlm["cmd"]
@@ -358,7 +408,8 @@ def main():
     ap.add_argument("--ros", action="store_true",
                     help="serial 대신 ROS2 Twist 를 /cmd_vel 로 발행")
     ap.add_argument("--topic", default="/cmd_vel", help="--ros 발행 토픽")
-    ap.add_argument("--max-lin", type=float, default=0.5, help="pad-full-deflection |vx|,|vy| in m/s")
+    ap.add_argument("--max-lin", type=float, default=0.5,
+                    help="pad limit and 1x Space speed in m/s; Space selector allows up to 3x")
     ap.add_argument("--max-ang", type=float, default=2.0,
                     help="rotation reference in rad/s; pad and Q/E send 50%% of this value")
     ap.add_argument("--deadzone", type=float, default=0.1,

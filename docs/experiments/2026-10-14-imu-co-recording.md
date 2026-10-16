@@ -14,6 +14,8 @@ IMU의 bias·offset·scale을 적용하고 실제 decoder의 축 정의가 보�
 
 **2026-10-15 후속: [정지 IMU 기반 중력 정렬·지형 지도](2026-10-15-gravity-terrain-pipeline.md)를 추가했다.** GUI의 ORB는 계속 non-inertial stereo다. 영상과 IMU의 Pi receipt monotonic 시각은 정지 구간을 찾는 데 사용하며, MCU/D435 acquisition clock 동기화가 검증됐다는 뜻은 아니다. `imu_clock_verified=false`, `orb_fused=false`를 유지한다. 가속도계 단독 roll/pitch는 움직임 중 중력 외 가속도가 섞이는 진단값이다. 중력 기준 차체 기울기는 별도로 visual pose와 장착 모델로 계산한다.
 
+**2026-10-16 후속:** [카메라–IMU 시간 정렬과 선택형 종료 후 융합](2026-10-16-imu-upstream-integration.md)을 도입했다. 기본 촬영은 그대로 stereo이고, 새 timing 형식과 품질 조건을 만족한 기록만 별도 관성 결과로 비교한다. 하드웨어 동기화 검증 플래그를 자동으로 true로 바꾸지 않는다.
+
 ## 매핑 전에 실행
 
 1. 보정 JSON을 노트북에 별도 보관한다. 기본 경로는 `outputs/handheld_mapping/calibration/imu_calibration.json`이며 장비별 파일을 Git에 올리지 않는다.
@@ -23,7 +25,7 @@ IMU의 bias·offset·scale을 적용하고 실제 decoder의 축 정의가 보�
 bash tools/mapping_imu_bridge.sh pi@raspberrypi.local
 ```
 
-이 터미널은 조종·촬영 중 열어둔다. 기존 노트북 조이스틱은 그대로 `--udp raspberrypi.local`로 연결한다. bridge 제한은 현재 병진 0.15 m/s, 회전 0.8 rad/s다. 펌웨어나 모터 제어식은 수정하지 않는다.
+이 터미널은 조종·촬영 중 열어둔다. 기존 노트북 조이스틱은 그대로 `--udp raspberrypi.local`로 연결한다. bridge 제한은 현재 병진 0.45 m/s, 회전 0.8 rad/s다. 조이스틱의 `--max-lin 0.15`를 기준으로 Space 직진 1/2/3배(0.15/0.30/0.45 m/s)를 허용하는 상한이며, 변경 후 bridge를 재시작해야 적용된다. 펌웨어나 모터 제어식은 수정하지 않는다.
 
 3. 노트북에서 매핑 창을 연다.
 

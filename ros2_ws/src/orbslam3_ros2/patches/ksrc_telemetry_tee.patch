@@ -4,7 +4,7 @@
  import struct
  import time
  
-+from telemetry_tee import TelemetryTee
++from telemetry_tee import TelemetryTee, receipt_clock
 +
  from nucleo_link import SpiLink, TLM_FLAG_GATE_PENDING, TLM_FLAG_WATCHDOG
  
@@ -43,7 +43,7 @@
 +
 +            if tee is not None:
 +                tee.emit({"schema": 1, "run_id": args.run_id,
-+                          "host_receipt_ns": time.time_ns(), "host_monotonic_ns": time.monotonic_ns(),
++                          **receipt_clock(),
 +                          "udp_seq": last_seq, "udp_age_s": None if peer is None else t0-last_rx,
 +                          "selected_cmd": list(send), "udp_nominal_cmd": list(udp_cmd), "stale": stale,
 +                          "decode_failures": n_bad, "tee_drops": tee.dropped, "telemetry": r,
@@ -72,7 +72,7 @@
  if __name__ == "__main__":
 --- /dev/null
 +++ b/pi/common/telemetry_tee.py
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,44 @@
 +# ================================================================
 +# telemetry_tee.py
 +# 설명: SPI owner가 이미 디코딩한 telemetry를 UNIX datagram으로 비차단 분기한다.
@@ -82,6 +82,17 @@
 +import socket
 +import time
 +from pathlib import Path
++
++
++def receipt_clock() -> dict:
++    """Preserve the SPI receipt's Pi host clocks in one short bracket."""
++    before = time.monotonic_ns()
++    realtime = time.time_ns()
++    raw = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
++    after = time.monotonic_ns()
++    return {'host_receipt_ns': realtime, 'host_monotonic_ns': (before+after)//2,
++            'host_monotonic_raw_ns': raw, 'host_clock_sample_span_ns': after-before}
++
 +
 +class TelemetryTee:
 +    """수신자 부재/포화/잘못된 JSON을 누락으로 집계하고 제어 루프로 즉시 복귀한다."""

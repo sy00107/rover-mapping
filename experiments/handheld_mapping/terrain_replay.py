@@ -84,7 +84,7 @@ def save_grid(terrain: TerrainGrid, output: Path, limits: RoverLimits,
 def replay(run: Path, output: Path, map_id: int, spec: GridSpec, grid_from_world: np.ndarray,
            limits: RoverLimits | None = None, backend: str = 'orb', depth_stride: int = 4,
            min_observations: int = 2, alignment_metadata: dict | None = None,
-           depth_max: float = 3.) -> dict:
+           depth_max: float = 3., depth_filter: DepthFilter | None = None) -> dict:
     """고정 최종 pose와 근접 depth를 한 장씩 읽어 기준 지형 지도를 만든다."""
     run, output = Path(run).resolve(), Path(output).resolve()
     if output.exists():
@@ -97,7 +97,9 @@ def replay(run: Path, output: Path, map_id: int, spec: GridSpec, grid_from_world
     info = json.loads((run/'capture_calibration.json').read_text())['depth']
     left_from_depth = transform(info['T_left_depth'])
     terrain = GroundGrid(spec)
-    filtering, filter_stats = DepthFilter(max_depth_m=depth_max), {}
+    filtering, filter_stats = depth_filter or DepthFilter(max_depth_m=depth_max), {}
+    if not np.isclose(filtering.max_depth_m, depth_max, rtol=0., atol=1e-9):
+        raise ValueError('depth filter and terrain maximum distance differ')
     integrated = total = 0
     for row, matched, _, depth in filtered_depths(run, run/backend/f'map_{map_id}_keyframes.csv',
                                                   map_id, info, alignment, filtering, filter_stats):

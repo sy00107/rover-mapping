@@ -106,6 +106,9 @@ class Session:
             self.status.update(values)
 
     def start(self, config: dict) -> None:
+        config = dict(config)
+        if config.get('inertial_fusion') and not config.get('demo'):
+            config['imu_enabled'] = True
         with self.lock:
             if self.status["state"] in ACTIVE or (self.thread is not None and self.thread.is_alive()):
                 raise RuntimeError("이미 실행 중입니다")
@@ -343,6 +346,9 @@ class Session:
                 from experiments.handheld_mapping.gravity import terrain_maps
                 terrain = terrain_maps(run,backend,gravity)
                 self.update(terrain=terrain)
+            self.update(dense=dense)
+            inertial_partial = (self._run_inertial_postprocessing(run)
+                                if config.get('inertial_fusion') and not config.get('demo') else False)
             line_partial = False
             if config.get("compare_lines"):
                 self.update(state="comparing", message="동일 원본으로 점+선 SLAM 비교 중")
@@ -351,7 +357,8 @@ class Session:
                 self.update(comparison=comparison)
                 line_partial = comparison.get("dense", {}).get("status", "complete") != "complete"
             gravity_partial = gravity_requested and (gravity['status'] != 'complete' or terrain['status'] != 'complete')
-            partial = dense["status"] != "complete" or finished.get("dropped", 0) > 0 or line_partial or imu_partial or gravity_partial
+            partial = (dense["status"] != "complete" or finished.get("dropped", 0) > 0
+                       or line_partial or imu_partial or gravity_partial or inertial_partial)
             message = ('중력·지형 결과 일부 미완료 · 원본과 3D 지도 저장 완료' if gravity_partial else
                        '일부 누락 있음 · 지도 저장 완료' if partial else '지도 저장 완료')
             self.update(state="partial" if partial else "complete", message=message,
@@ -396,6 +403,31 @@ class Session:
                     atomic_json(run / "session.json", self.snapshot())
                 except OSError as error:
                     self.update(state="failed", error=str(error), message="상태 파일 저장 실패: "+str(error))
+
+    def _run_inertial_postprocessing(self, run: Path) -> bool:
+        """기본 3D·지형을 보존한 뒤 선택형 IMU 융합을 실행하고 미완료 여부를 반환한다."""
+        fusion_result = None
+        try:
+            self.update(state='processing', message='저장한 영상과 IMU의 시간 정렬·융합 시험 중')
+            from experiments.handheld_mapping.inertial import run_inertial_auto
+            fusion_result = run_inertial_auto(run)
+            self.update(inertial_fusion=fusion_result)
+            if not fusion_result.get('orb_fused'):
+                self.update(inertial_warning=fusion_result.get('error') or 'IMU 초기화 미완료 · 기본 지도는 저장됨')
+                return True
+            self.update(state='reconstructing', message='IMU 융합 경로로 별도 3D 지도 생성 중')
+            from experiments.handheld_mapping.reconstruct import reconstruct
+            dense = reconstruct(run, backend='orb_inertial', progress=lambda message: self.update(message=message))
+            self.update(inertial_dense=dense)
+            if dense.get('status') != 'complete':
+                self.update(inertial_warning='IMU 융합 지도 일부 누락 · 기본 지도는 저장됨')
+                return True
+            return False
+        except Exception as error:
+            if fusion_result is None:
+                self.update(inertial_fusion={'status': 'failed', 'orb_fused': False, 'error': str(error)})
+            self.update(inertial_warning='IMU 후처리 실패 · 기본 지도는 저장됨: '+str(error))
+            return True
 
     def _finish_imu(self) -> dict | None:
         with self.lock:

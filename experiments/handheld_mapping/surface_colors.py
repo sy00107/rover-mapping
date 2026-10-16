@@ -121,8 +121,9 @@ def classify_surface_points(points, terrain):
     return labels
 
 
-def apply_surface_colors(geometry, geometry_path):
-    """화면의 메시 꼭짓점/점군에만 색을 입히며 원본 PLY와 형상은 바꾸지 않는다."""
+def apply_surface_colors(geometry, geometry_path, smooth_obstacles: bool = False,
+                         fill_ground_gaps: bool = False):
+    """저장 표면으로 분류하고 선택적으로 화면의 주황 메시만 평활화한다."""
     import open3d as o3d
     terrain = load_surface_layers(geometry_path)
     if terrain is None:
@@ -130,6 +131,14 @@ def apply_surface_colors(geometry, geometry_path):
     mesh = isinstance(geometry, o3d.geometry.TriangleMesh)
     points = np.asarray(geometry.vertices if mesh else geometry.points)
     labels = classify_surface_points(points, terrain)
+    ground_gaps = None
+    if mesh and fill_ground_gaps:
+        from experiments.handheld_mapping.ground_display import fill_small_ground_gaps
+        ground_gaps = fill_small_ground_gaps(geometry, labels)
+    smoothing = None
+    if mesh and smooth_obstacles:
+        from experiments.handheld_mapping.obstacle_display import smooth_obstacle_display
+        smoothing = smooth_obstacle_display(geometry, labels)
     colors = o3d.utility.Vector3dVector(PALETTE[labels])
     if mesh:
         geometry.vertex_colors = colors
@@ -138,5 +147,7 @@ def apply_surface_colors(geometry, geometry_path):
     counts = np.bincount(labels, minlength=3)
     return {'ground': int(counts[GROUND]), 'obstacle': int(counts[OBSTACLE]),
             'unknown': int(counts[UNKNOWN]), 'terrain': terrain['output_dir'],
+            'obstacle_smoothing': smoothing,
+            'ground_gap_fill': ground_gaps,
             'ground_tolerance_m': terrain['ground_tolerance_m'],
             'obstacle_threshold_m': terrain['obstacle_threshold_m']}

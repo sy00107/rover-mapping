@@ -144,6 +144,48 @@ def test_show_maps_applies_colours_by_default_and_can_disable_them(terrain_run, 
     assert len(np.unique(np.asarray(added[-1].vertex_colors), axis=0)) == 1
 
 
+def test_obstacle_display_keeps_source_geometry_terrain_and_classification(terrain_run):
+    import open3d as o3d
+    from test_obstacle_display import noisy_surface
+    path = terrain_run/'dense_offline/map_0_mesh.ply'
+    geometry, _ = noisy_surface()
+    points = np.asarray(geometry.vertices).copy()
+    points[:, :2] += .05
+    points[:, 2] += .2
+    geometry.vertices = o3d.utility.Vector3dVector(points)
+    o3d.io.write_triangle_mesh(str(path), geometry)
+    terrain_path = terrain_run/'terrain/orb_offline/map_0/terrain.npz'
+    before = {p: p.read_bytes() for p in (path, terrain_path)}
+    terrain = load_surface_layers(path)
+    labels = classify_surface_points(points, terrain)
+    stats = apply_surface_colors(geometry, path, smooth_obstacles=True)
+    assert stats['obstacle_smoothing']['smoothed_vertices'] > 0
+    np.testing.assert_array_equal(np.asarray(geometry.vertex_colors), PALETTE[labels])
+    np.testing.assert_array_equal(np.asarray(geometry.vertices)[labels != OBSTACLE], points[labels != OBSTACLE])
+    assert before == {p: p.read_bytes() for p in before}
+
+
+def test_green_gap_fill_is_display_only_and_can_be_disabled(terrain_run):
+    import copy
+    import open3d as o3d
+    from test_ground_display import ground_with_hole
+    geometry, _ = ground_with_hole()
+    path = terrain_run/'dense_offline/map_0_mesh.ply'
+    o3d.io.write_triangle_mesh(str(path), geometry)
+    terrain_path = terrain_run/'terrain/orb_offline/map_0/terrain.npz'
+    before = {p: p.read_bytes() for p in (path, terrain_path)}
+    original_faces = np.asarray(geometry.triangles).copy()
+    disabled = copy.deepcopy(geometry)
+    off = apply_surface_colors(disabled, path, fill_ground_gaps=False)
+    assert off['ground_gap_fill'] is None
+    np.testing.assert_array_equal(disabled.triangles, original_faces)
+    on = apply_surface_colors(geometry, path, smooth_obstacles=True, fill_ground_gaps=True)
+    assert on['ground_gap_fill']['filled_holes'] == 1
+    assert len(geometry.triangles) == len(original_faces)+10
+    assert np.all(np.asarray(geometry.vertex_colors) == PALETTE[GROUND])
+    assert before == {p: p.read_bytes() for p in before}
+
+
 @pytest.mark.parametrize('angle', [10., 15., 25., 35.])
 def test_flat_ramp_upper_flat_stays_ground_while_object_on_ramp_is_obstacle(angle):
     from experiments.handheld_mapping.ground import GroundGrid

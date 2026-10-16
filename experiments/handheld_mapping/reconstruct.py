@@ -78,6 +78,19 @@ def reconstruct(run_dir: Path, voxel_size: float = .01, depth_max: float = 3.,
     except (KeyError, TypeError, IndexError) as error:
         raise ValueError("depth scale and depth-to-left TF calibration required") from error
     keyfiles = sorted((run_dir / backend).glob("map_*_keyframes.csv"))
+    if backend == 'orb_inertial':
+        fusion = json.loads((run_dir/backend/'summary.json').read_text())
+        identities = fusion.get('exported_imu_initialized_maps')
+        # Compatibility with the existing measured-profile runner: it exports only
+        # initialized maps and records their count in its completion contract.
+        if identities is None and fusion.get('inertial_input', {}).get('clock_verified') is True:
+            completion = json.loads((run_dir/backend/'runner_complete.json').read_text())
+            if completion.get('imu_initialized_maps', 0) > 0:
+                identities = [int(path.stem.split('_')[1]) for path in keyfiles]
+        if (fusion.get('orb_fused') is not True or not isinstance(identities, list) or not identities
+                or any(type(value) is not int or value < 0 for value in identities)):
+            raise ValueError('initialized inertial export required for TSDF')
+        keyfiles = [path for path in keyfiles if path.name in {f'map_{value}_keyframes.csv' for value in identities}]
     if not keyfiles:
         raise ValueError("원본 depth 또는 최종 keyframe이 없습니다")
     output_name = {"orb": "dense", "orbline": "dense_orbline", "orb_offline": "dense_offline",
@@ -93,6 +106,9 @@ def reconstruct(run_dir: Path, voxel_size: float = .01, depth_max: float = 3.,
               "coordinate_system": "per-map initial camera optical; gravity alignment not applied",
               "accuracy_verified_on_real_camera": False, "maps": [], "skipped_maps": []}
     result['depth_filter'] = filtering.metadata()
+    if backend == 'orb_inertial':
+        result.update(coordinate_system='ORB stereo-inertial map; gravity estimate unverified',
+                      imu_clock_verified=False, pose_source='orb_inertial')
     for keyfile in keyfiles:
         map_id = keyfile.name.removeprefix("map_").removesuffix("_keyframes.csv")
         if not map_id.isdecimal():
@@ -105,6 +121,7 @@ def reconstruct(run_dir: Path, voxel_size: float = .01, depth_max: float = 3.,
             voxel_length=voxel_size, sdf_trunc=voxel_size*4,
             color_type=o3d.pipelines.integration.TSDFVolumeColorType.NoColor)
         integrated = 0
+        camera_positions = []
         total = max_gap = 0
         filter_stats = {}
         for row, frame, gap, depth in filtered_depths(run_dir, keyfile, int(map_id), info,
@@ -120,6 +137,7 @@ def reconstruct(run_dir: Path, voxel_size: float = .01, depth_max: float = 3.,
                 o3d.geometry.Image(depth), depth_scale=1/scale, depth_trunc=depth_max,
                 convert_rgb_to_intensity=False)
             volume.integrate(rgbd, intrinsic, np.linalg.inv(world_depth))
+            camera_positions.append(world_depth[:3, 3])
             integrated += 1
             max_gap = max(max_gap, gap)
             if progress:
@@ -131,6 +149,15 @@ def reconstruct(run_dir: Path, voxel_size: float = .01, depth_max: float = 3.,
         mesh.compute_vertex_normals()
         if len(mesh.triangles) == 0 or len(cloud.points) == 0:
             raise ValueError("empty TSDF surface")
+        cleanup_stats = None
+        if filtering.surface_cleanup:
+            from experiments.handheld_mapping.surface_cleanup import clean_surface_mesh
+            mesh, cleanup_stats = clean_surface_mesh(mesh, camera_positions)
+            if not len(mesh.triangles):
+                raise ValueError('surface cleanup removed all geometry')
+            cloud = o3d.geometry.PointCloud()
+            cloud.points = o3d.utility.Vector3dVector(np.asarray(mesh.vertices))
+            cloud.normals = o3d.utility.Vector3dVector(np.asarray(mesh.vertex_normals))
         mesh_path, cloud_path = f"{output_name}/map_{map_id}_mesh.ply", f"{output_name}/map_{map_id}_cloud.ply"
         if not o3d.io.write_triangle_mesh(str(destination / mesh_path), mesh):
             raise OSError("mesh write failed")
@@ -144,6 +171,7 @@ def reconstruct(run_dir: Path, voxel_size: float = .01, depth_max: float = 3.,
                               "world_from_slam":world_from_slam.tolist(),
                               "gravity_method":gravity['method'] if gravity else None,
                               "depth_filter_stats":filter_stats,
+                              "surface_cleanup": cleanup_stats,
                               "gravity_extrinsic_verified":gravity.get('extrinsic_verified',False) if gravity else False})
     if not result["maps"]:
         raise ValueError("No matching depth/keyframes with valid depth: 일치하는 유효 depth가 없습니다")

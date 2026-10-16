@@ -86,6 +86,30 @@ def stationary_reference(samples: list[dict], center_ns: int) -> dict:
             'max_acc_deviation_g':deviation, 'max_gyro_dps':gyro_max}
 
 
+def stationary_anchor_reference(samples: list[dict], anchor_ns: int) -> dict:
+    """Keep a full stationary window touching the pose, including capture boundaries.
+
+    A centered window can include handling motion before recording started.
+    Forward/backward windows still cover the anchor and must satisfy the same
+    duration, coverage, gap, segment, acceleration and gyro requirements.
+    """
+    reason = '촬영 pose와 겹치는 2초 정지 IMU 구간이 없습니다'
+    for placement, shift in (('centered', 0), ('forward', WINDOW_NS//2),
+                             ('backward', -WINDOW_NS//2)):
+        try:
+            reference = stationary_reference(samples, anchor_ns+shift)
+        except ValueError as error:
+            reason = str(error)
+            continue
+        # The anchor must touch the measured stationary interval; no detached
+        # stationary period may supply gravity for a moving camera pose.
+        if not reference['start_pi_ns']-MAX_GAP_NS <= anchor_ns <= reference['end_pi_ns']+MAX_GAP_NS:
+            continue
+        return {**reference, 'anchor_pi_ns':anchor_ns,
+                'window_center_pi_ns':anchor_ns+shift, 'window_placement':placement}
+    raise ValueError(reason)
+
+
 def sample_from_record(row: dict) -> dict | None:
     if row.get('acceptance') != 'accepted' or not row.get('calibrated'):
         return None
@@ -233,13 +257,15 @@ def derive_alignment(run: Path, backend: str, map_id: int) -> dict:
             center = frame.get('pi_receipt_monotonic_ns')
             if type(center) is not int:
                 continue
-            while sample is not None and sample['pi_ns'] <= center+WINDOW_NS//2:
+            # Retain enough support for a full window on either side of a
+            # capture-boundary keyframe, without reaching across a distant stop.
+            while sample is not None and sample['pi_ns'] <= center+WINDOW_NS:
                 window.append(sample)
                 sample = next(samples,None)
-            while window and window[0]['pi_ns'] < center-WINDOW_NS//2:
+            while window and window[0]['pi_ns'] < center-WINDOW_NS:
                 window.popleft()
             try:
-                reference = stationary_reference(list(window),center)
+                reference = stationary_anchor_reference(list(window),center)
             except ValueError as error:
                 reason = str(error)
                 continue
@@ -275,7 +301,7 @@ def process_maps(run: Path, backend: str) -> dict:
 
 
 def terrain_maps(run: Path, backend: str, gravity: dict, depth_max: float = 3.,
-                 output_root: Path | None = None) -> dict:
+                 output_root: Path | None = None, depth_filter=None) -> dict:
     """중력 기준을 얻은 map만 별도의 높이·경사·단차 결과로 저장한다."""
     from experiments.handheld_mapping.terrain import GridSpec
     from experiments.handheld_mapping.terrain_replay import replay
@@ -300,7 +326,7 @@ def terrain_maps(run: Path, backend: str, gravity: dict, depth_max: float = 3.,
                 revision += 1
                 output = destination/'terrain'/backend/f'map_{identity}_v{revision}'
             results[identity] = replay(run,output,identity,spec,matrix,backend=backend,
-                                       depth_max=depth_max, alignment_metadata={key:data[key] for key in
+                                       depth_max=depth_max, depth_filter=depth_filter, alignment_metadata={key:data[key] for key in
                                         ('method','extrinsic_verified','imu_clock_verified','orb_fused','origin')})
             results[identity]['output_dir'] = str(output)
         except (OSError,ValueError,KeyError) as error:

@@ -11,6 +11,20 @@ import pytest
 from telemetry_tee import TelemetryTee
 from ksrc_telemetry_capture import ImuClockAudit, imu_values
 
+
+def test_spi_receipt_clock_preserves_raw_and_bracket(monkeypatch):
+    import telemetry_tee
+    monotonic = iter([1000, 1200])
+    monkeypatch.setattr(telemetry_tee.time, 'monotonic_ns', lambda: next(monotonic))
+    monkeypatch.setattr(telemetry_tee.time, 'time_ns', lambda: 10**18)
+    def raw_clock(domain):
+        assert domain == telemetry_tee.time.CLOCK_MONOTONIC_RAW
+        return 900
+    monkeypatch.setattr(telemetry_tee.time, 'clock_gettime_ns', raw_clock)
+    assert telemetry_tee.receipt_clock() == {
+        'host_receipt_ns': 10**18, 'host_monotonic_ns': 1100,
+        'host_monotonic_raw_ns': 900, 'host_clock_sample_span_ns': 200}
+
 def test_absent_consumer_no_wait(tmp_path):
     tee = TelemetryTee(tmp_path/'missing.sock')
     begin = time.monotonic()

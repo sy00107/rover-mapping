@@ -6,7 +6,8 @@ import numpy as np
 import pytest
 
 from experiments.handheld_mapping.gravity import (alignment_matrix,derive_alignment,fingerprint,
-                                                 load_alignment,mounting,stationary_reference)
+                                                 load_alignment,mounting,stationary_reference,
+                                                 stationary_anchor_reference)
 from test_core import make_run
 
 
@@ -56,6 +57,56 @@ def test_motion_gaps_and_reset_cannot_define_gravity(problem):
     if problem=='reset':rows[-1]['segment']=1
     if problem=='nonfinite':rows[50]['acc_g']=[0.,0.,float('nan')]
     with pytest.raises(ValueError):stationary_reference(rows,3_000_000_000)
+
+
+@pytest.mark.parametrize('placement,direction', [('forward', 1), ('backward', -1)])
+def test_boundary_reference_uses_full_stationary_window_touching_anchor(placement, direction):
+    anchor = 3_000_000_000
+    rows = samples(center=anchor-direction*1_000_000_000)
+    rows += samples(center=anchor+direction*1_000_000_000)
+    rows = sorted({row['pi_ns']:row for row in rows}.values(),key=lambda row:row['pi_ns'])
+    for row in rows:
+        if (row['pi_ns']-anchor)*direction < 0:
+            row['gyro_dps'] = [0.,0.,10.]
+    with pytest.raises(ValueError):stationary_reference(rows,anchor)
+    reference = stationary_anchor_reference(rows,anchor)
+    assert reference['window_placement'] == placement
+    assert reference['samples'] == 101
+    assert reference['anchor_pi_ns'] == anchor
+    assert reference['max_gyro_dps'] == 0.
+    assert reference['end_pi_ns']-reference['start_pi_ns'] == 2_000_000_000
+
+
+@pytest.mark.parametrize('problem',['rotation','acceleration','gap','reset','too_short','detached'])
+def test_boundary_reference_does_not_bypass_stationarity_or_coverage(problem):
+    anchor = 3_000_000_000
+    rows = samples(center=anchor+1_000_000_000)
+    if problem=='rotation':rows[0]['gyro_dps']=[0.,0.,10.]
+    elif problem=='acceleration':rows[0]['acc_g']=[.2,0.,1.]
+    elif problem=='gap':del rows[20:40]
+    elif problem=='reset':rows[-1]['segment']=1
+    elif problem=='too_short':rows=rows[:60]
+    elif problem=='detached':
+        for row in rows:row['pi_ns']+=3_000_000_000
+    with pytest.raises(ValueError):stationary_anchor_reference(rows,anchor)
+
+
+def test_offline_gravity_recovers_capture_start_without_changing_pose_or_imu(gravity_run):
+    path=gravity_run/'imu.jsonl'
+    data=[]
+    for row in samples(center=3_000_000_000)+samples(center=4_000_000_000):
+        if row['pi_ns']<3_000_000_000:row['gyro_dps']=[0.,0.,10.]
+        data.append({'acceptance':'accepted','clock':{'pi_receipt_monotonic_ns':row['pi_ns'],'segment':0},
+                     'calibrated':{'acc_g':row['acc_g'],'gyro_dps':row['gyro_dps']}})
+    data=sorted({row['clock']['pi_receipt_monotonic_ns']:row for row in data}.values(),
+                key=lambda row:row['clock']['pi_receipt_monotonic_ns'])
+    path.write_text(''.join(json.dumps(row)+'\n' for row in data))
+    before={p:p.read_bytes() for p in [path,gravity_run/'orb/map_0_keyframes.csv']}
+    result=derive_alignment(gravity_run,'orb',0)
+    assert result['stationary_reference']['window_placement']=='forward'
+    assert result['anchor_keyframe_id']==0
+    assert load_alignment(gravity_run,'orb',0)==result
+    assert all(p.read_bytes()==content for p,content in before.items())
 
 
 def test_gravity_alignment_uses_tilted_rover_and_camera_mount(gravity_run):

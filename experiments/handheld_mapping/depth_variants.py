@@ -7,6 +7,7 @@ import shutil
 
 from experiments.handheld_mapping.gravity import fingerprint, load_alignment, terrain_maps
 from experiments.handheld_mapping.reconstruct import reconstruct
+from experiments.handheld_mapping.depth_filter import DepthFilter
 from experiments.handheld_mapping.storage import atomic_json
 
 
@@ -22,12 +23,14 @@ def variant_source(output_root: Path, backend: str) -> Path:
     return Path(data['source_run']).resolve()
 
 
-def ensure_depth_variant(run: Path, depth_max: float, backend: str = 'auto', progress=None) -> Path:
+def ensure_depth_variant(run: Path, depth_max: float, backend: str = 'auto', progress=None,
+                         surface_cleanup: bool = False) -> Path:
     """같은 입력/설정의 완성본은 재사용하고 변경 시 새 revision으로 보존한다."""
     from experiments.handheld_mapping.viewer import FOLDERS, select_maps
     run = Path(run).expanduser().resolve()
     if not math.isfinite(depth_max) or not .3 < depth_max <= 10:
         raise ValueError('--depth-max는 0.3보다 크고 10 이하인 유한한 m 값이어야 합니다')
+    filtering = DepthFilter(max_depth_m=depth_max, surface_cleanup=surface_cleanup)
     if not run.is_dir() or (run/'depth_variant.json').exists():
         raise ValueError('--depth-max에는 원본 촬영 RUN 폴더를 지정하세요')
     if backend == 'auto':
@@ -48,13 +51,14 @@ def ensure_depth_variant(run: Path, depth_max: float, backend: str = 'auto', pro
                 if (path := run/'gravity'/backend/f'map_{identity}.json').is_file()]
     code_root = Path(__file__).parent
     pipeline_files = ('depth_variants.py', 'reconstruct.py', 'depth_filter.py', 'terrain_replay.py',
-                      'ground.py', 'terrain.py', 'costmap.py', 'gravity.py', 'recording.py')
+                      'ground.py', 'terrain.py', 'costmap.py', 'gravity.py', 'recording.py', 'surface_cleanup.py')
     source_hashes = {str(path.relative_to(run)): fingerprint(path) for path in sources}
     cache_key = {'source_run': str(run), 'backend': backend, 'depth_max_m': float(depth_max),
                  'voxel_size_m': .01, 'source_sha256': source_hashes,
+                 'depth_filter': filtering.metadata(),
                  'pipeline_sha256': {name: fingerprint(code_root/name) for name in pipeline_files}}
     tag = str(int(depth_max)) if float(depth_max).is_integer() else str(float(depth_max)).replace('.', 'p')
-    name = f'depth_{tag}m'
+    name = f'depth_{tag}m'+('_clean' if surface_cleanup else '')
     parent = run/'depth_variants'/backend
     candidates = []
     if parent.is_dir():
@@ -93,6 +97,7 @@ def ensure_depth_variant(run: Path, depth_max: float, backend: str = 'auto', pro
     manifest = {'schema': 1, 'status': 'building', 'source_run': str(run), 'backend': backend,
                 'depth_max_m': float(depth_max), 'range_kind': 'camera optical Z, not map radius',
                 'raw_and_orb_poses_unchanged': True, 'cache_key': cache_key}
+    manifest['surface_cleanup'] = surface_cleanup
     atomic_json(output/'depth_variant.json', manifest)
     try:
         # These snapshots keep the old variant's path/colours valid if original poses later change.
@@ -108,13 +113,14 @@ def ensure_depth_variant(run: Path, depth_max: float, backend: str = 'auto', pro
         if progress:
             progress(f'{depth_max:g}m: 원본 depth + 최종 ORB pose로 3D 지도 생성 중')
         dense = reconstruct(run, backend=backend, depth_max=depth_max,
-                            gravity_alignments=gravity, output_root=output)
+                            gravity_alignments=gravity, output_root=output, depth_filter=filtering)
         integrated_maps = {row['map_id'] for row in dense['maps']}
         gravity = {key: value for key, value in gravity.items() if key in integrated_maps}
         if gravity:
             if progress:
                 progress(f'{depth_max:g}m: 같은 거리 제한으로 지면·장애물 분류 중')
-            terrain = terrain_maps(run, backend, {'maps': gravity}, depth_max=depth_max, output_root=output)
+            terrain = terrain_maps(run, backend, {'maps': gravity}, depth_max=depth_max,
+                                   output_root=output, depth_filter=filtering)
             if terrain['failed_maps']:
                 raise ValueError(f'지형 결과 생성 실패: {terrain["failed_maps"]}')
         else:

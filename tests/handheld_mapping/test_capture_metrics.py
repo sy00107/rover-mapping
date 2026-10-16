@@ -34,6 +34,7 @@ def capture_node() -> object:
                       if isinstance(node, ast.ClassDef) and node.name == 'CaptureNode')
     namespace = {'Node': FakeNode, 'deque': deque, 'ByteQueue': ByteQueue, 'FrameBundler': FrameBundler,
                  'CaptureMetrics': pi_worker.CaptureMetrics, 'queue': queue,
+                 'receipt_clock': pi_worker.receipt_clock,
                  'time': pi_worker.time, 'args': SimpleNamespace(queue_mib=4.),
                  'stop': threading.Event(), 'qos_profile_sensor_data': object(),
                  'tf2_ros': SimpleNamespace(Buffer=lambda: None, TransformListener=lambda *args: None),
@@ -74,8 +75,25 @@ def test_capture_excludes_startup_but_legacy_source_frames_includes_it(monkeypat
     headers = [header for header in headers if header['stream'] == 'left']
     assert [header['stream_seq'] for header in headers] == [1, 2]
     assert headers[0]['pi_receipt_monotonic_ns'] == 2_000_000_000
+    assert headers[0]['stamp_ns'] == 10_100_000_000
+    assert isinstance(headers[0]['pi_receipt_realtime_ns'], int)
+    assert isinstance(headers[0]['pi_receipt_monotonic_raw_ns'], int)
+    assert headers[0]['pi_clock_sample_span_ns'] == 0
     assert headers[0]['pi_enqueue_monotonic_ns'] == 2_000_000_000
     assert snapshot['streams']['right']['received'] == 2
+
+
+def test_camera_clock_pair_preserves_domains_and_records_sampling_uncertainty(monkeypatch):
+    ticks = iter((1000, 1200))
+    monkeypatch.setattr(pi_worker.time, 'monotonic_ns', lambda: next(ticks))
+    monkeypatch.setattr(pi_worker.time, 'time_ns', lambda: 200000)
+    def raw(clock_id):
+        assert clock_id == pi_worker.time.CLOCK_MONOTONIC_RAW
+        return 7000
+    monkeypatch.setattr(pi_worker.time, 'clock_gettime_ns', raw)
+    assert pi_worker.receipt_clock() == {'pi_receipt_monotonic_ns': 1100,
+        'pi_receipt_realtime_ns': 200000, 'pi_receipt_monotonic_raw_ns': 7000,
+        'pi_clock_sample_span_ns': 200}
 
 
 def test_image_drops_are_separate_from_pose_and_status_drops() -> None:

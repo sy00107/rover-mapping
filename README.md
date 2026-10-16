@@ -16,6 +16,9 @@ D435와 Raspberry Pi로 영상을 수집하고, 노트북에서 ORB-SLAM3·TSDF 
 | 입력 공백 조사 | [조사 보고](docs/experiments/2026-10-14-input-gap-investigation.md) |
 | 최신 20° 카메라 장착 URDF | [기구 기준·보정 적용 범위](docs/experiments/2026-10-14-rover-extrinsics-update.md) |
 | 보정 IMU와 D435 동시 기록 | [실행·검증 결과](docs/experiments/2026-10-14-imu-co-recording.md) |
+| 카메라–IMU 시간 정렬·종료 후 선택형 융합 | [도입 내용·사용법·현재 검증 범위](docs/experiments/2026-10-16-imu-upstream-integration.md) |
+| 기존 촬영들의 별도 통합 지도 | [영상 검증·원본 깊이 병합·결과 보기](docs/experiments/2026-10-16-session-merge.md) |
+| 전체 촬영 검토·촬영 간 충돌 관측 필터 | [사용한 기록·노이즈 검사·새 통합 지도](docs/experiments/2026-10-16-session-consensus.md) |
 | upstream 버전·patch | [외부 의존성](third_party/README.md) |
 
 ## 빠른 시작

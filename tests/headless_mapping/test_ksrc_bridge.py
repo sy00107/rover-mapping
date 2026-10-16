@@ -17,7 +17,8 @@ ROOT=Path(__file__).resolve().parents[2]
 BASE=Path(os.environ.get('KSRC_REVIEW_ROOT','/tmp/rover-ksrc-review-fIZ5v1/ksrc-4bd158b1125cee32c5851f74ecc0c8f3d71013b1'))
 
 @pytest.mark.parametrize('consumer',['absent','slow'])
-def test_bridge_command_equivalence(monkeypatch,tmp_path,consumer):
+@pytest.mark.parametrize('linear_limit', [.32, .45])
+def test_bridge_command_equivalence(monkeypatch,tmp_path,consumer,linear_limit):
     if not (BASE/'pi/common/udp_spi_bridge.py').is_file(): pytest.skip('KSRC fixed review source required')
     target=tmp_path/'patched'; (target/'pi/common').mkdir(parents=True)
     shutil.copyfile(BASE/'pi/common/udp_spi_bridge.py',target/'pi/common/udp_spi_bridge.py')
@@ -55,12 +56,12 @@ def test_bridge_command_equivalence(monkeypatch,tmp_path,consumer):
             def time_ns(self): return 10**18+int(self.value*1e9)
             def sleep(self,seconds): self.value+=seconds
         module.time=FakeTime()
-        argv=['bridge','--port',str(port)]
+        argv=['bridge','--port',str(port),'--max-lin',str(linear_limit)]
         if enabled: argv+=['--telemetry-socket',str(path),'--run-id','fixture']
         monkeypatch.setattr(sys,'argv',argv); module.main(); sender.close(); results.append(calls)
     if receiver: receiver.close()
     assert results[0]==results[1]
     commands=[cmd for cmd,kw in results[1]]
-    assert commands[1] == (.32,-.32,2.)
+    assert commands[1] == (linear_limit,-linear_limit,2.)
     assert commands[20] == (0.,0.,0.)
     assert commands[-5:] == [(0.,0.,0.)]*5

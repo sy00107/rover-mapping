@@ -123,6 +123,30 @@ def map_frame(geometry_path: Path):
     return transform(row['world_from_slam']),True
 
 
+def load_trajectory_groups(geometry_path: Path) -> list:
+    """Keep independent recording trajectories separate in merged-map displays."""
+    backend = next((key for key,value in FOLDERS.items() if value == geometry_path.parent.name),None)
+    match = re.fullmatch(r'map_(\d+)_(?:mesh|cloud)\.ply',geometry_path.name)
+    if backend is None or match is None:
+        return []
+    source = geometry_path.parent.parent/backend/f'map_{int(match[1])}_keyframes.csv'
+    if not source.is_file():
+        return []
+    with source.open() as stream:
+        reader = csv.DictReader(stream)
+        if 'source_session' not in (reader.fieldnames or []):
+            points = load_trajectory(geometry_path)
+            return [points] if points else []
+        rows = list(reader)
+    # Reuse the existing numerical/map/pose validation before grouping.
+    points = load_trajectory(geometry_path)
+    rows.sort(key=lambda row:(float(row['source_stamp']),int(row['keyframe_id'])))
+    groups = {}
+    for row, point in zip(rows, points):
+        groups.setdefault(row['source_session'],[]).append(point)
+    return list(groups.values())
+
+
 def trajectory_geometries(points: list[tuple[float,float,float]]) -> list:
     """3D 위치를 그대로 연결하고 시작/끝을 구분한다. 원본 PLY는 수정하지 않는다."""
     import open3d as o3d
@@ -148,7 +172,8 @@ def trajectory_geometries(points: list[tuple[float,float,float]]) -> list:
 
 
 def show_maps(selected: list[tuple[str,Path]], cloud: bool = False, trajectory: bool = True,
-              terrain_colors: bool = True) -> None:
+              terrain_colors: bool = True, obstacle_smoothing: bool = True,
+              ground_gap_fill: bool = True) -> None:
     import open3d as o3d
     windows = []
     try:
@@ -166,12 +191,18 @@ def show_maps(selected: list[tuple[str,Path]], cloud: bool = False, trajectory: 
             if terrain_colors:
                 from experiments.handheld_mapping.surface_colors import apply_surface_colors, LEGEND
                 try:
-                    classified = apply_surface_colors(geometry, path)
+                    classified = apply_surface_colors(geometry, path, smooth_obstacles=obstacle_smoothing,
+                                                       fill_ground_gaps=ground_gap_fill)
                     if classified is not None:
                         color_legend = LEGEND+' | '
                         print(f'{label}: {LEGEND} · 지면 {classified["ground"]:,} / '
                               f'장애물 {classified["obstacle"]:,} / 미분류 {classified["unknown"]:,} '
                               f'· {classified["terrain"]}', flush=True)
+                        if classified['obstacle_smoothing'] is not None:
+                            smooth = classified['obstacle_smoothing']
+                            print(f'{label}: 장애물 표시 평활화 {smooth["smoothed_vertices"]:,}개 정점', flush=True)
+                        if classified['ground_gap_fill'] is not None:
+                            print(f'{label}: 지면의 작은 빈틈 {classified["ground_gap_fill"]["filled_holes"]:,}개 표시 보완', flush=True)
                     else:
                         print(f'{label}: 대응 지형 분류가 없어 기본 색으로 표시합니다.', flush=True)
                 except (OSError, ValueError, KeyError, TypeError) as error:
@@ -179,8 +210,9 @@ def show_maps(selected: list[tuple[str,Path]], cloud: bool = False, trajectory: 
             overlays = []
             if trajectory:
                 try:
-                    points = load_trajectory(path)
-                    overlays = trajectory_geometries(points)
+                    groups = load_trajectory_groups(path)
+                    points = [point for group in groups for point in group]
+                    overlays = [geometry for group in groups for geometry in trajectory_geometries(group)]
                     if points:
                         print(f'{label}: 최종 ORB 키프레임 {len(points)}개로 카메라 추정 경로 표시 '
                               '(파랑 경로 / 초록 시작 / 빨강 끝; 로봇 중심·실측 경로 아님)',flush=True)
@@ -202,6 +234,9 @@ def show_maps(selected: list[tuple[str,Path]], cloud: bool = False, trajectory: 
             viewer.get_render_option().line_width=3.
             viewer.get_render_option().mesh_color_option = o3d.visualization.MeshColorOption.Color
             viewer.get_render_option().point_color_option = o3d.visualization.PointColorOption.Color
+            if obstacle_smoothing and terrain_colors:
+                # Open3D 0.19 Python calls SmoothShade (C++ enum value 1) "Color".
+                viewer.get_render_option().mesh_shade_option = o3d.visualization.MeshShadeOption(1)
             control=viewer.get_view_control()
             control.set_lookat(geometry.get_center()); control.set_up([0,0,1] if gravity_aligned else [0,-1,0])
             control.set_front([1,-1,.7] if gravity_aligned else [0,0,-1]); control.set_zoom(.7)
@@ -229,15 +264,21 @@ def main() -> None:
     parser.add_argument('--no-terrain-colors',action='store_true',help='지면·장애물 분류 색을 끄고 단색으로 표시')
     parser.add_argument('--depth-max', type=float, help='최대 depth [m]; 거리별 결과를 생성/재사용해 표시 (예:1,2,3)')
     parser.add_argument('--build-only', action='store_true', help='--depth-max 결과만 생성하고 3D 창은 열지 않음')
+    parser.add_argument('--surface-cleanup', action='store_true', help='먼 표면의 잔물결·작은 빈틈·미세 조각을 보정한 비교본 생성')
+    parser.add_argument('--no-obstacle-smoothing', action='store_true', help='주황 장애물의 화면 평활화와 부드러운 음영 끄기')
+    parser.add_argument('--no-ground-gap-fill', action='store_true', help='초록 지면의 작은 구멍을 메우는 화면 보완 끄기')
     args=parser.parse_args()
     if args.build_only and args.depth_max is None:
         parser.error('--build-only에는 --depth-max가 필요합니다')
+    if args.surface_cleanup and args.depth_max is None:
+        parser.error('--surface-cleanup에는 --depth-max가 필요합니다')
     try:
         target = args.target
         if args.depth_max is not None:
             from experiments.handheld_mapping.depth_variants import ensure_depth_variant
             target = ensure_depth_variant(resolve_target(target), args.depth_max, args.backend,
-                                           progress=lambda message: print(message, flush=True))
+                                           progress=lambda message: print(message, flush=True),
+                                           surface_cleanup=args.surface_cleanup)
         selected=select_maps(target,args.backend,args.map_id,args.cloud)
         if args.build_only:
             print(f'결과 준비 완료: {target}', flush=True)
@@ -245,7 +286,8 @@ def main() -> None:
         if len(selected)>1: print('여러 map은 각각 별도 좌표계·창으로 표시합니다.',flush=True)
         print('왼쪽 드래그 회전 | 휠 확대 | Shift+왼쪽 드래그 이동',flush=True)
         show_maps(selected,args.cloud,trajectory=not args.no_trajectory,
-                  terrain_colors=not args.no_terrain_colors)
+                  terrain_colors=not args.no_terrain_colors, obstacle_smoothing=not args.no_obstacle_smoothing,
+                  ground_gap_fill=not args.no_ground_gap_fill)
     except (ValueError,FileNotFoundError,RuntimeError) as error:
         parser.exit(1,str(error)+'\n')
 
