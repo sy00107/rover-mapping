@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.16)
+project(rover_rtab_compare LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+find_package(RTABMap REQUIRED COMPONENTS core)
+add_executable(rover_rtab_compare main.cpp)
+target_link_libraries(rover_rtab_compare PRIVATE rtabmap::core)
+add_executable(rover_orb_rtab_fusion orb_fusion.cpp)
+target_link_libraries(rover_orb_rtab_fusion PRIVATE rtabmap::core)

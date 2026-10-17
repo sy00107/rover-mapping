@@ -12,7 +12,8 @@ import re
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
-FOLDERS = {'orb_inertial':'dense_inertial','orb_offline':'dense_offline','orb':'dense','orbline':'dense_orbline'}
+# Prefer the full camera reconstruction; experimental IMU maps may cover only a segment.
+FOLDERS = {'orb_offline':'dense_offline','orb':'dense','orbline':'dense_orbline','orb_inertial':'dense_inertial'}
 
 
 def resolve_target(target: Path | None, sessions: Path | None = None) -> Path:
@@ -173,7 +174,7 @@ def trajectory_geometries(points: list[tuple[float,float,float]]) -> list:
 
 def show_maps(selected: list[tuple[str,Path]], cloud: bool = False, trajectory: bool = True,
               terrain_colors: bool = True, obstacle_smoothing: bool = True,
-              ground_gap_fill: bool = True) -> None:
+              ground_gap_fill: bool = True, path_measurements: bool = True) -> None:
     import open3d as o3d
     windows = []
     try:
@@ -208,6 +209,7 @@ def show_maps(selected: list[tuple[str,Path]], cloud: bool = False, trajectory: 
                 except (OSError, ValueError, KeyError, TypeError) as error:
                     print(f'{label}: 지면 색상 표시 생략: {error}', flush=True)
             overlays = []
+            billboard = None
             if trajectory:
                 try:
                     groups = load_trajectory_groups(path)
@@ -220,12 +222,24 @@ def show_maps(selected: list[tuple[str,Path]], cloud: bool = False, trajectory: 
                         print(f'{label}: 대응하는 최종 키프레임이 없어 경로를 표시하지 않습니다.',flush=True)
                 except (ValueError,OSError,csv.Error) as error:
                     print(f'{label}: 이동 경로 표시 생략: {error}',flush=True)
+                if path_measurements:
+                    from experiments.handheld_mapping.trajectory_measurements import (
+                        BillboardLabels, load_pose_groups, measurements)
+                    try:
+                        labels = [row for group in load_pose_groups(path) for row in measurements(group)]
+                        if labels:
+                            billboard = BillboardLabels(labels)
+                            print(f'{label}: 경로 거리·회전 {len(labels)}개 · m: 직선 구간 3D 거리 / '
+                                  'L·R: 좌·우 방향 변화 · ORB 카메라 추정값 '
+                                  + ('(중력 기준)' if gravity_aligned else '(초기 카메라 수평면 기준)'),flush=True)
+                    except (ValueError,OSError,KeyError,TypeError,csv.Error) as error:
+                        print(f'{label}: 거리·각도 표시 생략: {error}',flush=True)
             viewer = o3d.visualization.Visualizer()
             suffix = (' | Gravity Z-up' if gravity_aligned else '') + (' | ORB camera trajectory' if overlays else '')
             if not viewer.create_window(window_name=f'Rover 3D | {color_legend}{path.parent.parent.name} | {label}{suffix}',
                                         width=1100,height=780):
                 raise RuntimeError('3D 창 초기화 실패. tools/view_mapping.sh로 DISPLAY/X11 환경에서 실행하세요.')
-            windows.append((viewer,[geometry,*overlays]))
+            windows.append((viewer,[geometry,*overlays],billboard))
             if not viewer.add_geometry(geometry): raise RuntimeError(f'3D geometry 표시 실패: {path}')
             for overlay in overlays:
                 if not viewer.add_geometry(overlay): raise RuntimeError(f'이동 경로 표시 실패: {path}')
@@ -241,17 +255,37 @@ def show_maps(selected: list[tuple[str,Path]], cloud: bool = False, trajectory: 
             control.set_lookat(geometry.get_center()); control.set_up([0,0,1] if gravity_aligned else [0,-1,0])
             control.set_front([1,-1,.7] if gravity_aligned else [0,0,-1]); control.set_zoom(.7)
             viewer.poll_events(); viewer.update_renderer()
+            if billboard is not None:
+                update_path_labels(viewer,billboard)
             print('VIEWER_READY',label,path,flush=True)
         while windows:
-            for viewer,geometry in windows[:]:
+            for viewer,geometry,billboard in windows[:]:
                 if viewer.poll_events():
+                    if billboard is not None:
+                        update_path_labels(viewer,billboard)
                     viewer.update_renderer()
                 else:
                     viewer.destroy_window()
-                    windows.remove((viewer,geometry))
+                    windows.remove((viewer,geometry,billboard))
             time.sleep(.02)
     finally:
-        for viewer,_geometry in windows: viewer.destroy_window()
+        for viewer,_geometry,_billboard in windows: viewer.destroy_window()
+
+
+def update_path_labels(viewer, billboard) -> None:
+    """Keep labels readable when rotating/zooming without changing the map's framing."""
+    control=viewer.get_view_control()
+    if hasattr(control,'set_constant_z_near'):
+        control.set_constant_z_near(.01)
+    if not billboard.update(control.convert_to_pinhole_camera_parameters()):
+        return
+    if not getattr(billboard,'added',False):
+        if len(billboard.geometry.points):
+            if not viewer.add_geometry(billboard.geometry,reset_bounding_box=False):
+                raise RuntimeError('경로 숫자 표시 초기화 실패')
+            billboard.added=True
+    else:
+        viewer.update_geometry(billboard.geometry)
 
 
 def main() -> None:
@@ -261,6 +295,7 @@ def main() -> None:
     parser.add_argument('--map-id',type=int)
     parser.add_argument('--cloud',action='store_true',help='mesh 대신 point cloud 표시')
     parser.add_argument('--no-trajectory',action='store_true',help='최종 ORB 카메라 추정 경로 숨기기')
+    parser.add_argument('--no-path-measurements',action='store_true',help='경로 옆 거리(m)·좌우 회전각 표시 숨기기')
     parser.add_argument('--no-terrain-colors',action='store_true',help='지면·장애물 분류 색을 끄고 단색으로 표시')
     parser.add_argument('--depth-max', type=float, help='최대 depth [m]; 거리별 결과를 생성/재사용해 표시 (예:1,2,3)')
     parser.add_argument('--build-only', action='store_true', help='--depth-max 결과만 생성하고 3D 창은 열지 않음')
@@ -287,7 +322,7 @@ def main() -> None:
         print('왼쪽 드래그 회전 | 휠 확대 | Shift+왼쪽 드래그 이동',flush=True)
         show_maps(selected,args.cloud,trajectory=not args.no_trajectory,
                   terrain_colors=not args.no_terrain_colors, obstacle_smoothing=not args.no_obstacle_smoothing,
-                  ground_gap_fill=not args.no_ground_gap_fill)
+                  ground_gap_fill=not args.no_ground_gap_fill, path_measurements=not args.no_path_measurements)
     except (ValueError,FileNotFoundError,RuntimeError) as error:
         parser.exit(1,str(error)+'\n')
 

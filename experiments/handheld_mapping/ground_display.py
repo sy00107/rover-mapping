@@ -43,22 +43,31 @@ def _triangulate_polygon(points):
     return result
 
 
-def fill_small_ground_gaps(mesh, labels):
+def fill_small_ground_gaps(mesh, labels, *, maximum_diameter_m=.05, maximum_edges=20,
+                           maximum_plane_residual_m=.008, candidate_validator=None,
+                           prevent_nonmanifold=False):
     """지름5cm·20변 이하이며 초록으로 둘러싸인 평면 내부 구멍만 메운다."""
     import open3d as o3d
     from experiments.handheld_mapping.surface_colors import GROUND
 
+    if (not np.isfinite(maximum_diameter_m) or maximum_diameter_m <= 0
+            or not isinstance(maximum_edges, int) or maximum_edges < 3
+            or not np.isfinite(maximum_plane_residual_m) or maximum_plane_residual_m <= 0):
+        raise ValueError('invalid ground hole limits')
     vertices, triangles = np.asarray(mesh.vertices), np.asarray(mesh.triangles)
     labels = np.asarray(labels)
     if labels.shape != (len(vertices),):
         raise ValueError('ground labels do not match mesh vertices')
     stats = {'method': 'enclosed_green_ground_holes_v1', 'filled_holes': 0,
-             'added_triangles': 0, 'maximum_hole_diameter_m': .05,
+             'added_triangles': 0, 'maximum_hole_diameter_m': maximum_diameter_m,
              'new_vertices': False, 'scope': 'viewer memory only; inferred display patches'}
     if not len(triangles) or not np.any(labels == GROUND):
         return stats
     directed = np.concatenate([triangles[:, [0, 1]], triangles[:, [1, 2]], triangles[:, [2, 0]]])
-    _, first, counts = np.unique(np.sort(directed, axis=1), axis=0, return_index=True, return_counts=True)
+    unique_edges, first, counts = np.unique(np.sort(directed, axis=1), axis=0, return_index=True, return_counts=True)
+    edge_codes = unique_edges[:, 0].astype(np.int64)*len(vertices)+unique_edges[:, 1]
+    added_edge_counts = {}
+    stats['topology_rejected_holes'] = 0
     boundary = directed[first[counts == 1]]
     face_ids = np.tile(np.arange(len(triangles)), 3)[first[counts == 1]]
     mesh.compute_triangle_normals()
@@ -85,18 +94,18 @@ def fill_small_ground_gaps(mesh, labels):
             if current == start:
                 closed = True
                 break
-        if not closed or not 3 <= len(chain) <= 20:
+        if not closed or not 3 <= len(chain) <= maximum_edges:
             continue
         indices = boundary[chain, 0]
         if not np.all(labels[indices] == GROUND):
             continue
         points = vertices[indices]
         distance = np.linalg.norm(points[:, None]-points[None, :], axis=2)
-        if distance.max() > .05:
+        if distance.max() > maximum_diameter_m:
             continue
         centered = points-points.mean(axis=0)
         _, singular, basis = np.linalg.svd(centered, full_matrices=False)
-        if singular[1] < 1e-5 or np.max(np.abs(centered@basis[2])) > .008:
+        if singular[1] < 1e-5 or np.max(np.abs(centered@basis[2])) > maximum_plane_residual_m:
             continue
         reference = normals[face_ids[chain]].mean(axis=0)
         area = np.cross(centered, np.roll(centered, -1, axis=0)).sum(axis=0)
@@ -109,7 +118,26 @@ def fill_small_ground_gaps(mesh, labels):
         faces = _triangulate_polygon(projected)
         if len(faces) != len(indices)-2:
             continue
-        additions.extend(indices[np.asarray(faces)].tolist())
+        added = indices[np.asarray(faces)]
+        if candidate_validator is not None and not candidate_validator(vertices[added]):
+            continue
+        if prevent_nonmanifold:
+            patch_edges = np.sort(np.concatenate([added[:, [0, 1]], added[:, [1, 2]], added[:, [2, 0]]]), axis=1)
+            codes, patch_counts = np.unique(patch_edges[:, 0].astype(np.int64)*len(vertices)+patch_edges[:, 1],
+                                            return_counts=True)
+            positions = np.searchsorted(edge_codes, codes)
+            present = positions < len(edge_codes)
+            present[present] &= edge_codes[positions[present]] == codes[present]
+            existing = np.zeros(len(codes), int)
+            existing[present] = counts[positions[present]]
+            existing += np.array([added_edge_counts.get(int(code), 0) for code in codes])
+            if np.any(existing+patch_counts > 2):
+                stats['topology_rejected_holes'] += 1
+                continue
+            for code, count in zip(codes, patch_counts):
+                key = int(code)
+                added_edge_counts[key] = added_edge_counts.get(key, 0)+int(count)
+        additions.extend(added.tolist())
         stats['filled_holes'] += 1
     if additions:
         mesh.triangles = o3d.utility.Vector3iVector(np.r_[triangles, additions])

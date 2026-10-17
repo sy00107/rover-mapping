@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from test_viewer import maps, keyframes
-from experiments.handheld_mapping.surface_colors import (GROUND, OBSTACLE, UNKNOWN, PALETTE,
+from experiments.handheld_mapping.surface_colors import (GROUND, OBSTACLE, UNKNOWN, PALETTE, SLOPE_COLOR,
     apply_surface_colors, classify_surface_points, load_surface_layers)
 
 
@@ -117,7 +117,7 @@ def test_colours_change_only_display_geometry_not_saved_file(terrain_run, cloud)
     np.testing.assert_array_equal(np.asarray(geometry.points if cloud else geometry.vertices), points)
     assert path.read_bytes() == saved
     if cloud:
-        np.testing.assert_allclose(colours, PALETTE[[GROUND, OBSTACLE, UNKNOWN]])
+        np.testing.assert_allclose(colours, np.array([SLOPE_COLOR, PALETTE[OBSTACLE], PALETTE[UNKNOWN]]))
 
 
 def test_show_maps_applies_colours_by_default_and_can_disable_them(terrain_run, monkeypatch):
@@ -139,7 +139,7 @@ def test_show_maps_applies_colours_by_default_and_can_disable_them(terrain_run, 
     monkeypatch.setattr(o3d.visualization, 'Visualizer', Viewer)
     show_maps([('Map 0', path)], trajectory=False)
     assert len(np.unique(np.asarray(added[-1].vertex_colors), axis=0)) >= 2
-    assert '초록: 지면' in titles[-1]
+    assert '핑크: 경사 지면' in titles[-1]
     show_maps([('Map 0', path)], trajectory=False, terrain_colors=False)
     assert len(np.unique(np.asarray(added[-1].vertex_colors), axis=0)) == 1
 
@@ -182,7 +182,7 @@ def test_green_gap_fill_is_display_only_and_can_be_disabled(terrain_run):
     on = apply_surface_colors(geometry, path, smooth_obstacles=True, fill_ground_gaps=True)
     assert on['ground_gap_fill']['filled_holes'] == 1
     assert len(geometry.triangles) == len(original_faces)+10
-    assert np.all(np.asarray(geometry.vertex_colors) == PALETTE[GROUND])
+    assert np.all(np.asarray(geometry.vertex_colors) == SLOPE_COLOR)
     assert before == {p: p.read_bytes() for p in before}
 
 
@@ -216,3 +216,14 @@ def test_flat_ramp_upper_flat_stays_ground_while_object_on_ramp_is_obstacle(angl
         assert floor_labels[(floor[:, 0] > 1.05) & (floor[:, 0] < 1.15)].tolist().count(OBSTACLE) == 0
     else:
         assert cost[8, 22] < 254
+
+
+def test_slope_pink_threshold_preserves_flat_obstacle_and_unknown():
+    from experiments.handheld_mapping.surface_colors import surface_point_colors
+    points = np.array([[.05,.05,0],[.15,.05,0],[.25,.05,0],[.35,.05,0]])
+    terrain = {'bounds': np.array([0.,.4,0.,.1]), 'resolution':.1,
+               'grid_from_geometry':np.eye(4), 'layers':{
+                   'reference_ground_gradient_x':np.tan(np.deg2rad([[0.,10.,10.,10.]])),
+                   'reference_ground_gradient_y':np.zeros((1,4))}}
+    colors = surface_point_colors(points,np.array([GROUND,GROUND,OBSTACLE,UNKNOWN]),terrain)
+    np.testing.assert_allclose(colors,[PALETTE[GROUND],SLOPE_COLOR,PALETTE[OBSTACLE],PALETTE[UNKNOWN]])

@@ -12,7 +12,9 @@ from experiments.handheld_mapping.reconstruct import transform
 
 GROUND, OBSTACLE, UNKNOWN = 1, 2, 0
 PALETTE = np.array([[.52, .57, .62], [.20, .78, .35], [1., .38, .10]])
-LEGEND = '초록: 지면 | 주황: 장애물 표면 | 회색: 미분류'
+SLOPE_COLOR = np.array([1., .20, .65])
+SLOPE_THRESHOLD_DEG = 5.
+LEGEND = '초록: 평지 | 핑크: 경사 지면(5° 이상) | 주황: 장애물 표면 | 회색: 미분류'
 
 
 def load_surface_layers(geometry_path: Path):
@@ -121,6 +123,24 @@ def classify_surface_points(points, terrain):
     return labels
 
 
+def surface_point_colors(points, labels, terrain):
+    """Colour observed ground slopes relative to gravity without changing semantic labels."""
+    points = np.asarray(points)
+    colors = PALETTE[labels].copy()
+    xyz = points @ terrain['grid_from_geometry'][:3,:3].T + terrain['grid_from_geometry'][:3,3]
+    bounds, res = terrain['bounds'], terrain['resolution']
+    ids = np.flatnonzero((labels == GROUND) & np.isfinite(xyz).all(axis=1)
+                        & (xyz[:,0] >= bounds[0]) & (xyz[:,0] < bounds[1])
+                        & (xyz[:,1] >= bounds[2]) & (xyz[:,1] < bounds[3]))
+    x = np.floor((xyz[ids,0]-bounds[0])/res).astype(int)
+    y = np.floor((xyz[ids,1]-bounds[2])/res).astype(int)
+    layers = terrain['layers']
+    slope = np.degrees(np.arctan(np.hypot(layers['reference_ground_gradient_x'][y,x],
+                                        layers['reference_ground_gradient_y'][y,x])))
+    colors[ids[np.isfinite(slope) & (slope >= SLOPE_THRESHOLD_DEG)]] = SLOPE_COLOR
+    return colors
+
+
 def apply_surface_colors(geometry, geometry_path, smooth_obstacles: bool = False,
                          fill_ground_gaps: bool = False):
     """저장 표면으로 분류하고 선택적으로 화면의 주황 메시만 평활화한다."""
@@ -139,7 +159,7 @@ def apply_surface_colors(geometry, geometry_path, smooth_obstacles: bool = False
     if mesh and smooth_obstacles:
         from experiments.handheld_mapping.obstacle_display import smooth_obstacle_display
         smoothing = smooth_obstacle_display(geometry, labels)
-    colors = o3d.utility.Vector3dVector(PALETTE[labels])
+    colors = o3d.utility.Vector3dVector(surface_point_colors(np.asarray(geometry.vertices if mesh else geometry.points), labels, terrain))
     if mesh:
         geometry.vertex_colors = colors
     else:

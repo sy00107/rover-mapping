@@ -44,6 +44,22 @@ def test_viewer_explicit_backend_map_cloud_and_direct_ply(tmp_path):
     with pytest.raises(ValueError):select_maps(run,backend='unknown')
 
 
+def test_auto_prefers_camera_maps_over_partial_imu_and_allows_explicit_imu(tmp_path):
+    from experiments.handheld_mapping.viewer import select_maps
+    run = maps(tmp_path/'run', 'dense_inertial')
+    maps(run, 'dense')
+    assert all(p.parent.name == 'dense' for _, p in select_maps(run))
+    maps(run, 'dense_offline')
+    assert all(p.parent.name == 'dense_offline' for _, p in select_maps(run))
+    assert all(p.parent.name == 'dense_inertial' for _, p in select_maps(run, backend='orb_inertial'))
+
+
+def test_imu_only_recording_is_still_viewable(tmp_path):
+    from experiments.handheld_mapping.viewer import select_maps
+    run = maps(tmp_path/'run', 'dense_inertial')
+    assert all(p.parent.name == 'dense_inertial' for _, p in select_maps(run))
+
+
 def test_viewer_rejects_summary_path_escape_and_missing_geometry(tmp_path):
     from experiments.handheld_mapping.viewer import select_maps
     run=maps(tmp_path/'run')
@@ -144,6 +160,6 @@ def test_viewer_adds_trajectory_to_same_window_and_can_hide_it(tmp_path,monkeypa
         def update_renderer(self):pass
         def destroy_window(self):pass
     monkeypatch.setattr(o3d.visualization,'Visualizer',Viewer)
-    show_maps([('Map 0',path)],trajectory=trajectory)
+    show_maps([('Map 0',path)],trajectory=trajectory,path_measurements=False)
     assert len(added)==expected_count
     if trajectory:assert isinstance(added[1],o3d.geometry.LineSet)

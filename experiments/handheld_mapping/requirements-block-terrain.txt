@@ -1,0 +1,4 @@
+# Optional robust union for simplified closed terrain STL.
+manifold3d==3.5.4
+# Polygon contours and constrained triangulation for map-like STL exports.
+shapely==2.1.2

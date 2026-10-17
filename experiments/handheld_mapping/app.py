@@ -10,7 +10,7 @@ import sys
 import signal
 import subprocess
 
-from PyQt5.QtCore import Qt, QTimer, QUrl
+from PyQt5.QtCore import Qt, QTimer, QUrl, QProcess
 from PyQt5.QtGui import QDesktopServices, QImage, QPixmap
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, QGridLayout,
                             QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget)
@@ -32,7 +32,7 @@ class MappingWindow(QWidget):
         self.setStyleSheet("""
             QWidget { background:#111820; color:#e8edf2; font-size:14px; }
             QLineEdit,QComboBox { background:#1b2733; border:1px solid #344556; border-radius:6px; padding:9px; }
-            QPushButton { background:#243445; border:1px solid #41566a; border-radius:7px; padding:12px 18px; }
+            QPushButton { background:#243445; border:1px solid #41566a; border-radius:7px; padding:8px 18px; }
             QPushButton:hover { background:#334d64; }
             QPushButton:disabled { color:#647382; background:#19232d; border-color:#253340; }
             QPushButton#start { background:#176951; border-color:#259b79; font-weight:bold; }
@@ -42,12 +42,14 @@ class MappingWindow(QWidget):
             QLabel#preview { background:#090e14; border:1px solid #2c3a48; border-radius:8px; }
         """)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(26, 18, 26, 18)
+        layout.setContentsMargins(26, 12, 26, 12)
+        layout.setSpacing(4)
         heading = QLabel("D435  /  HANDHELD MAPPING")
         heading.setObjectName("heading")
         layout.addWidget(heading)
         layout.addWidget(QLabel("노트북 원본 저장  ·  ORB 위치추정  ·  종료 후 TSDF 표면 생성"))
         fields = QGridLayout()
+        fields.setVerticalSpacing(2)
         self.host = QLineEdit("pi@raspberrypi.local")
         self.output = QLineEdit(str(output_root or ROOT / "outputs/handheld_mapping/sessions"))
         self.mode = QComboBox()
@@ -124,6 +126,7 @@ class MappingWindow(QWidget):
         self.overlay_note = QLabel('관측 횟수 오버레이 · 노랑 적음 / 초록 여러 시점')
         self.overlay_note.setWordWrap(True)
         cameras = QVBoxLayout()
+        cameras.setSpacing(4)
         cameras.addWidget(QLabel('원본 카메라 영상'))
         cameras.addWidget(self.preview,1)
         cameras.addWidget(self.overlay_note)
@@ -136,16 +139,46 @@ class MappingWindow(QWidget):
         self.path_label = QLabel("매번 새 날짜별 폴더를 만들며 기존 기록을 덮어쓰지 않습니다")
         self.path_label.setWordWrap(True)
         layout.addWidget(self.path_label)
+        viewing = QHBoxLayout()
+        viewing.addWidget(QLabel('3D 보기 설정'))
+        self.view_backend = QComboBox()
+        self.view_backend.addItem('기본 카메라 지도 (우선)', 'auto')
+        self.view_backend.addItem('IMU 융합 시험 지도', 'orb_inertial')
+        self.view_backend.addItem('점+선 비교 지도', 'orbline')
+        self.view_backend.setToolTip('기본은 전체 카메라 지도입니다. IMU 시험 지도는 일부 구간만 있을 수 있습니다.')
+        viewing.addWidget(self.view_backend)
+        self.view_depth = QComboBox()
+        for label, value in [('2m', 2.), ('1m', 1.), ('3m', 3.), ('저장된 기본 지도', None)]:
+            self.view_depth.addItem(label, value)
+        self.view_depth.setToolTip('원본에서 거리별 비교본을 생성합니다. 첫 생성은 시간이 걸리며 이후에는 재사용합니다.')
+        viewing.addWidget(self.view_depth)
+        self.view_cleanup = QCheckBox('표면 보정')
+        self.view_cleanup.setChecked(True)
+        self.view_cleanup.setToolTip('선택한 거리의 깊이와 표면을 보정합니다. 원본과 기존 기본 지도는 보존합니다.')
+        viewing.addWidget(self.view_cleanup)
+        self.view_measurements = QCheckBox('거리·각도 표시')
+        self.view_measurements.setChecked(False)
+        self.view_measurements.setToolTip('체크하면 경로 옆에 구간 거리와 좌우 회전각을 표시합니다. 하늘색 경로는 항상 유지합니다.')
+        viewing.addWidget(self.view_measurements)
+        viewing.addStretch()
+        self.view_depth.currentIndexChanged.connect(
+            lambda _: self.view_cleanup.setEnabled(self.view_depth.currentData() is not None))
+        layout.addLayout(viewing)
         controls = QHBoxLayout()
         self.start_button, self.stop_button = QPushButton("매핑 시작"), QPushButton("종료 및 지도 생성")
         self.start_button.setObjectName("start")
         self.stop_button.setObjectName("stop")
         self.open_button, self.rebuild_button = QPushButton("저장 폴더 열기"), QPushButton("기록에서 다시 생성")
         self.view_button = QPushButton('3D 지도 보기')
+        self.export_process = None
+        self.joined_export_button = QPushButton('평면 보정 STL 내보내기')
+        self.joined_export_button.setToolTip('중력 유지 · 평지/경사를 평면으로 보정 · 장애물 표면 보존 · STL(m/mm)')
+        self.joined_export_button.clicked.connect(self.export_joined_stl)
         self.terrain_button = QPushButton('높이·경사 보기')
         for button in (self.start_button, self.stop_button, self.view_button, self.terrain_button, self.open_button, self.rebuild_button):
             controls.addWidget(button)
         layout.addLayout(controls)
+        layout.addWidget(self.joined_export_button)
         self.start_button.clicked.connect(self.start)
         self.stop_button.clicked.connect(session.stop)
         self.open_button.clicked.connect(self.open_folder)
@@ -198,23 +231,79 @@ class MappingWindow(QWidget):
             self.refresh()
 
     def view_map(self) -> None:
-        from experiments.handheld_mapping.viewer import select_maps
+        from experiments.handheld_mapping.viewer import FOLDERS, select_maps
         selected = self.session.snapshot()['run_dir'] or QFileDialog.getExistingDirectory(
             self,'3D 지도가 저장된 촬영 폴더 선택',self.output.text())
         if not selected:
             return
         try:
-            select_maps(Path(selected))
+            run = Path(selected)
+            backend = self.view_backend.currentData()
+            selected_maps = select_maps(run, backend=backend)
+            # Pin the displayed result's backend before any depth reconstruction.
+            backend = next(key for key, folder in FOLDERS.items()
+                           if selected_maps[0][1].parent.name == folder)
+            command = [sys.executable, '-m', 'experiments.handheld_mapping.viewer', str(run),
+                       '--backend', backend]
+            if not self.view_measurements.isChecked():
+                command.append('--no-path-measurements')
+            depth = self.view_depth.currentData()
+            derived = (run/'depth_variant.json').is_file() or (run/'merge.json').is_file()
+            if depth is not None and not derived:
+                command += ['--depth-max', f'{depth:g}']
+                if self.view_cleanup.isChecked():
+                    command.append('--surface-cleanup')
+                message = f'{depth:g}m'+(' · 표면 보정' if self.view_cleanup.isChecked() else '')
+                message += ' 지도 준비 중 · 첫 생성에는 시간이 걸립니다 · map_viewer.log 확인'
+            else:
+                message = ('저장된 통합·거리별 지도 열기 · 해당 결과의 기존 거리·보정 설정을 사용합니다'
+                           if derived else '저장된 기본 지도 열기')
+            message += ' · '+('거리·각도 표시' if self.view_measurements.isChecked() else '거리·각도 숨김')
             environment = dict(os.environ)
             if environment.get('DISPLAY'):
                 environment.pop('WAYLAND_DISPLAY',None)
                 environment['XDG_SESSION_TYPE'] = 'x11'
-            with (Path(selected)/'map_viewer.log').open('ab') as log:
-                subprocess.Popen([sys.executable,'-m','experiments.handheld_mapping.viewer',selected],
+            with (run/'map_viewer.log').open('ab') as log:
+                subprocess.Popen(command,
                                  cwd=ROOT,env=environment,stdout=log,stderr=log,start_new_session=True)
+            self.session.update(message=message)
+            self.refresh()
         except (ValueError,OSError) as error:
             self.session.update(message=str(error))
             self.refresh()
+
+    def export_joined_stl(self) -> None:
+        from datetime import datetime
+        selected = self.session.snapshot()['run_dir'] or QFileDialog.getExistingDirectory(
+            self, 'STL로 내보낼 촬영 폴더 선택', self.output.text())
+        if not selected:
+            return
+        run = Path(selected)
+        output = run/'exports'/('planar_'+datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
+        command = ['-m', 'experiments.handheld_mapping.joined_export', str(run),
+                   '--output', str(output), '--backend', self.view_backend.currentData()]
+        depth = self.view_depth.currentData()
+        if depth is not None and not ((run/'depth_variant.json').is_file() or (run/'merge.json').is_file()):
+            command += ['--depth-max', str(depth)]
+        process = QProcess(self)
+        self.export_process = process
+        process.setWorkingDirectory(str(ROOT))
+        process.setProcessChannelMode(QProcess.MergedChannels)
+        process.setStandardOutputFile(str(run/'joined_export.log'))
+        def finished(code, *args):
+            self.export_process = None
+            if code == 0:
+                self.session.update(message=f'평면 보정 STL 저장 완료: {output}')
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(output)))
+            else:
+                self.session.update(message=f'STL 생성 실패 · {run/"joined_export.log"} 확인')
+            process.deleteLater()
+            self.refresh()
+        process.finished.connect(finished)
+        process.errorOccurred.connect(lambda error: finished(-1) if error == QProcess.FailedToStart else None)
+        process.start(sys.executable, command)
+        self.session.update(message='평면 보정 STL 생성 중 · 완료 후 결과 폴더가 열립니다')
+        self.refresh()
 
     def view_terrain(self) -> None:
         selected = self.session.snapshot()['run_dir'] or QFileDialog.getExistingDirectory(
@@ -236,6 +325,8 @@ class MappingWindow(QWidget):
     def refresh(self) -> None:
         status = self.session.snapshot()
         active = status["state"] in ACTIVE or (self.session.thread is not None and self.session.thread.is_alive())
+        active = active or self.export_process is not None
+        self.joined_export_button.setEnabled(not active)
         self.start_button.setEnabled(not active)
         self.stop_button.setEnabled(status["state"] in {"starting", "recording"})
         self.rebuild_button.setEnabled(not active)
@@ -351,6 +442,10 @@ class MappingWindow(QWidget):
             self.close()
 
     def closeEvent(self, event) -> None:
+        if self.export_process is not None:
+            self.session.update(message="STL 생성 완료 후 창을 닫아주세요.")
+            event.ignore()
+            return
         active = self.session.snapshot()["state"] in ACTIVE or (self.session.thread is not None and self.session.thread.is_alive())
         if active:
             self.close_pending = True
