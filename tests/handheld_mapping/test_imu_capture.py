@@ -383,3 +383,37 @@ def test_bridge_counter_reset_fails_and_retains_offending_raw_packet(tmp_path: P
     assert len(rows) == 3
     assert rows[-1]['raw'] == reset
     assert rows[-1]['acceptance'] == 'invalid_measurement'
+
+
+def test_timeout_explains_receiver_connected_but_bridge_silent(tmp_path):
+    imu=capture(tmp_path,[ready()])
+    with pytest.raises(TimeoutError,match='데이터가 0건'):
+        imu.start(timeout=.15)
+    assert imu.process.poll() is not None
+
+
+def test_timeout_distinguishes_invalid_flag_from_missing_bridge(tmp_path):
+    imu=capture(tmp_path,[ready(),packet(10,flags=0),packet(20,flags=0)])
+    with pytest.raises(TimeoutError,match='IMU_VALID'):
+        imu.start(timeout=.15)
+    assert imu.snapshot()['recorded']==2
+
+
+def test_bridge_preflight_matches_exact_sender_arguments_only(tmp_path):
+    from experiments.handheld_mapping.imu_health import bridge_processes
+    for pid,args in [('101',['python3','bridge.py','--telemetry-socket','/tmp/imu.sock']),
+                     ('102',['python3','subscriber.py','--socket','/tmp/imu.sock']),
+                     ('103',['bash','-c','bridge.py --telemetry-socket /tmp/imu.sock']),
+                     ('104',['python3','bridge.py','--telemetry-socket=/tmp/imu.sock'])]:
+        folder=tmp_path/pid;folder.mkdir();(folder/'cmdline').write_bytes(('\0'.join(args)+'\0').encode())
+    assert bridge_processes('/tmp/imu.sock',tmp_path)==[101,104]
+    assert bridge_processes('/tmp/other.sock',tmp_path)==[]
+
+
+def test_startup_failure_keeps_remote_bridge_diagnostic(tmp_path):
+    imu=capture(tmp_path,[])
+    imu.command=[sys.executable,'-u','-c',
+        "import sys;print('IMU 브리지가 실행 중이 아닙니다',file=sys.stderr,flush=True);sys.exit(2)"]
+    with pytest.raises(RuntimeError,match='IMU 브리지가 실행 중이 아닙니다'):
+        imu.start(timeout=1)
+    assert imu.process.poll() is not None

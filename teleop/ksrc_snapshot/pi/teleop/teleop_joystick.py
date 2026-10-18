@@ -6,20 +6,15 @@ KSRC 스워브 로버용 화면 마우스 조이스틱 텔레옵.
   왼쪽  (마우스 드래그) -> 병진 (vx, vy)
   오른쪽(마우스 드래그) -> 회전 (omega), 가로축만
 
-*** Q/E 키 회전이 따로 있는 이유 ***
-마우스 커서는 하나라 패드 둘을 동시에 끌 수 없다. 오른쪽 패드로 회전을 유지한
-채 왼쪽 패드로 병진을 주는 게 불가능하다는 뜻이다. 그래서 Q/E 가 omega 로 가는
-두 번째 경로를 제공한다 (터미널 기반 teleop_keyboard.py 와 달리 pygame 은 진짜
-키다운/키업 이벤트를 주므로 **누르고 있는 동안** 적용된다).
-최종 omega = 오른쪽 패드를 끄는 중이면 그 값, 아니면 Q/E 로 누르고 있는 값,
-아니면 0. 즉 마우스로 왼쪽 패드를 끌면서 Q/E 를 눌러 **호를 그리며 주행**할 수 있다.
-매핑 중 급회전을 줄이기 위해 패드/Q/E 회전 명령은 --max-ang 기준의 50%로 보낸다.
-
-두 패드 모두 마우스를 떼면 (0,0) 으로 돌아온다 -- "명령하지 않는 중" 이라는
-모호하지 않은 안전 상태다. 스페이스바를 누르는 동안에는 --max-lin 기준
-1/2/3배 속도로 직진한다 (횡이동·회전 없음). 숫자 1/2/3 또는 화면 버튼으로
-배율을 선택하며 시작은 1배다. 스페이스바를 떼거나 창 포커스를 잃으면 정지한다.
-포커스가 돌아와도 스페이스바를 새로 눌러야 다시 직진한다.
+키보드 / 화면 8방향 패드:
+  ↑ 또는 Space: 전진, ↓: 후진, ← 또는 Q: 좌회전, → 또는 E: 우회전.
+  전후 + 좌우를 함께 누르면 차체 회전 없이 45° 방향으로 평행 이동한다.
+  좌우 단독 입력은 제자리 회전이다. 대각선에서도 전체 이동 속도는 선택값을 유지한다.
+  화면의 8방향 버튼도 누르는 동안 같은 명령을 보낸다.
+  1/2/3 또는 화면 속도 버튼으로 전후 속도 배율을 선택한다.
+  회전은 --max-ang의 50%다. 키보드는 마우스 패드보다 우선한다.
+  키/버튼을 떼면 해당 명령이 해제된다. 포커스를 잃으면 모두 정지하며,
+  돌아와도 새 키 입력이나 클릭이 있어야 움직인다.
 
 와이어 포맷 두 가지 (--format):
   ascii  -> "V <vx> <vy> <omega>\\n" 줄. STM32 펌웨어의 터미널 파서가 그대로
@@ -52,14 +47,31 @@ from common.nucleo_link import (TLM_FLAG_GATE_PENDING, TLM_FLAG_WATCHDOG,
 from joystick_math import (apply_deadzone, clamp_to_unit_circle, left_pad_to_linear,
                            lock_low_speed_direction, right_pad_to_angular, snap_to_axes)
 
-WIDTH, HEIGHT = 640, 450
+WIDTH, HEIGHT = 940, 450
 PAD_RADIUS = 100
 LEFT_CENTER = (170, 190)
 RIGHT_CENTER = (470, 190)
 GRAB_SLACK = 1.4  # click within radius*GRAB_SLACK of center still grabs the pad
-ROTATION_SPEED_SCALE = 0.5  # 패드와 Q/E의 회전 명령만 50%로 제한
+ROTATION_SPEED_SCALE = 0.5  # 모든 회전 입력은 같은 50% 제한
 FORWARD_SPEED_CHOICES = (1, 2, 3)
 SPEED_BUTTON_RECTS = ((16, 334, 192, 32), (224, 334, 192, 32), (432, 334, 192, 32))
+
+# (label, forward, side): side is left/right translation in a diagonal, yaw when alone.
+DIRECTION_BUTTONS = (
+    ("F+L", 1, 1), ("FWD", 1, 0), ("F+R", 1, -1),
+    ("LEFT", 0, 1), ("STOP", 0, 0), ("RIGHT", 0, -1),
+    ("B+L", -1, 1), ("BACK", -1, 0), ("B+R", -1, -1),
+)
+DIRECTION_RECTS = tuple((650 + col*90, 105 + row*62, 84, 56)
+                        for row in range(3) for col in range(3))
+
+
+def drive_direction(forward, side, linear_speed, angular_speed):
+    """Diagonal = 45-degree crab translation; left/right alone = in-place yaw."""
+    if forward:
+        scale = linear_speed/math.hypot(forward, side)
+        return forward*scale, side*scale, 0.0
+    return 0.0, 0.0, side*angular_speed*ROTATION_SPEED_SCALE
 
 
 class Pad:
@@ -142,11 +154,14 @@ def run(args):
     # sim/test_e2e_teleop.py 는 이 필드 없이 자기 Args 객체를 만들어 가상
     # Nucleo 를 구동하는데, 그쪽은 바이너리 프로토콜을 쓴다. 따라서 속성이
     # 없으면 "binary" 를 뜻해야 한다.
-    ros_mode = getattr(args, "ros", False)
-    spi_mode = getattr(args, "spi", False)
+    demo_mode = getattr(args, "demo", False)
+    ros_mode = getattr(args, "ros", False) and not demo_mode
+    spi_mode = getattr(args, "spi", False) and not demo_mode
     last_tlm = None   # --spi: 가장 최근 텔레메트리
     n_spi_bad = 0
-    if ros_mode:
+    if demo_mode:
+        send = lambda vx, vy, omega: None
+    elif ros_mode:
         sink = RosSink(getattr(args, "topic", "/cmd_vel"))
         send = sink.send
     elif getattr(args, "udp", None):
@@ -195,9 +210,9 @@ def run(args):
         send = lambda vx, vy, omega: ser.write(encode(vx, vy, omega))
 
     # --monitor: STM 이 받은 값을 되돌려 찍게 하고(CTRL ON), 보낸 값과 나란히 출력한다.
-    udp_mode = bool(getattr(args, "udp", None))
+    udp_mode = bool(getattr(args, "udp", None)) and not demo_mode
     tlm_mode = spi_mode or udp_mode   # 텔레메트리를 직접 받는 모드 (시리얼 CTRL 불필요)
-    monitor = getattr(args, "monitor", False) and not ros_mode
+    monitor = getattr(args, "monitor", False) and not ros_mode and not demo_mode
     rx_buf = b""
     next_mon = time.monotonic()
     if monitor and tlm_mode:
@@ -208,7 +223,7 @@ def run(args):
 
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
-    pygame.display.set_caption("KSRC swerve teleop (joystick)")
+    pygame.display.set_caption("KSRC Controller — DEMO (no robot output)" if demo_mode else "KSRC swerve teleop (joystick)")
     font = pygame.font.SysFont(None, 22)
     clock = pygame.time.Clock()
 
@@ -222,13 +237,16 @@ def run(args):
     next_send = time.monotonic()
     last_dir = None   # 직전에 내보낸 병진 방향 (저속 방향 고정용)
     running = True
-    forward_held = False
+    held_keys = set()
+    motion_keys = {pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT,
+                   pygame.K_SPACE, pygame.K_q, pygame.K_e}
+    direction_buttons = [pygame.Rect(rect) for rect in DIRECTION_RECTS]
+    mouse_direction = None
     controls_focused = True
     forward_multiplier = 1
 
     try:
         while running:
-            forward_released = False
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
@@ -237,26 +255,37 @@ def run(args):
                 elif event.type == pygame.KEYDOWN and event.key in speed_keys:
                     if controls_focused:
                         forward_multiplier = speed_keys[event.key]
-                elif event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
+                elif event.type == pygame.KEYDOWN and event.key in motion_keys:
                     if controls_focused and not getattr(event, "repeat", False):
-                        forward_held = True
-                elif event.type == pygame.KEYUP and event.key == pygame.K_SPACE:
-                    forward_held = False
-                    forward_released = True
-                    left_pad.release()
-                    right_pad.release()
-                    last_dir = None
+                        held_keys.add(event.key)
+                        if event.key in {pygame.K_UP, pygame.K_SPACE, pygame.K_DOWN}:
+                            left_pad.release()
+                        right_pad.release()
+                        mouse_direction = None
+                        last_dir = None
+                elif event.type == pygame.KEYUP and event.key in motion_keys:
+                    held_keys.discard(event.key)
                 elif (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
                       and controls_focused):
                     selected = next((mult for mult, rect in zip(FORWARD_SPEED_CHOICES, speed_buttons)
                                      if rect.collidepoint(event.pos)), None)
                     if selected is not None:
                         forward_multiplier = selected
+                    elif any(rect.collidepoint(event.pos) for rect in direction_buttons):
+                        index = next(i for i, rect in enumerate(direction_buttons) if rect.collidepoint(event.pos))
+                        mouse_direction = DIRECTION_BUTTONS[index][1:]
+                        held_keys.clear()
+                        left_pad.release()
+                        right_pad.release()
+                        last_dir = None
                     elif left_pad.contains(event.pos):
+                        mouse_direction = None
                         left_pad.start_drag(event.pos)
                     elif right_pad.contains(event.pos):
+                        mouse_direction = None
                         right_pad.start_drag(event.pos)
                 elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                    mouse_direction = None
                     left_pad.release()
                     right_pad.release()
                 elif event.type == pygame.MOUSEMOTION and controls_focused:
@@ -268,7 +297,8 @@ def run(args):
                       (event.type == pygame.ACTIVEEVENT and not event.gain and
                        event.state & (pygame.APPINPUTFOCUS | pygame.APPACTIVE))):
                     controls_focused = False
-                    forward_held = False
+                    held_keys.clear()
+                    mouse_direction = None
                     left_pad.release()
                     right_pad.release()
                     last_dir = None
@@ -277,11 +307,12 @@ def run(args):
                        event.state & (pygame.APPINPUTFOCUS | pygame.APPACTIVE))):
                     controls_focused = True
 
-            keys = pygame.key.get_pressed()
-            if forward_held:
+            if held_keys & {pygame.K_UP, pygame.K_SPACE, pygame.K_DOWN}:
                 left_pad.release()
                 right_pad.release()
                 last_dir = None
+            elif held_keys:
+                right_pad.release()
 
             dz = getattr(args, "deadzone", 0.0)
             lnx, lny = apply_deadzone(left_pad.nx, left_pad.ny, dz)
@@ -293,16 +324,21 @@ def run(args):
             if right_pad.dragging:
                 rnx, _ = apply_deadzone(right_pad.nx, 0.0, dz)
                 omega = right_pad_to_angular(rnx, args.max_ang)
-            elif keys[pygame.K_q] and not keys[pygame.K_e]:
-                omega = args.max_ang
-            elif keys[pygame.K_e] and not keys[pygame.K_q]:
-                omega = -args.max_ang
             else:
                 omega = 0.0
             omega *= ROTATION_SPEED_SCALE
-            if forward_held:
-                vx, vy, omega = args.max_lin * forward_multiplier, 0.0, 0.0
-            if not controls_focused or forward_released or not running:
+            if held_keys:
+                forward = int(bool(held_keys & {pygame.K_UP, pygame.K_SPACE})) - int(pygame.K_DOWN in held_keys)
+                turn = int(bool(held_keys & {pygame.K_LEFT, pygame.K_q})) - int(bool(held_keys & {pygame.K_RIGHT, pygame.K_e}))
+                if held_keys & {pygame.K_UP, pygame.K_SPACE, pygame.K_DOWN}:
+                    vx, vy, omega = drive_direction(forward, turn, args.max_lin*forward_multiplier, args.max_ang)
+                else:
+                    # Keep the original mouse translation + Q/E rotation controls.
+                    omega = args.max_ang * ROTATION_SPEED_SCALE * turn
+            elif mouse_direction is not None:
+                forward, side = mouse_direction
+                vx, vy, omega = drive_direction(forward, side, args.max_lin*forward_multiplier, args.max_ang)
+            if not controls_focused or not running:
                 vx = vy = omega = 0.0
 
             now = time.monotonic()
@@ -348,9 +384,17 @@ def run(args):
                 screen.blit(text, (pad.center[0] - text.get_width() // 2, pad.center[1] + pad.radius + 10))
 
             readout = f"vx={vx:+.2f} m/s  vy={vy:+.2f} m/s  omega={omega:+.2f} rad/s"
-            help_text = "Space: hold forward / release stop | Q/E rotate | Esc quit"
+            help_text = "Arrows: diagonal = 45deg crab | Space = Up | Q/E = Left/Right | Esc quit"
             screen.blit(font.render(readout, True, (220, 220, 230)), (16, 16))
             screen.blit(font.render(help_text, True, (140, 140, 150)), (16, 44))
+            if demo_mode:
+                screen.blit(font.render("DEMO ONLY - no network / serial / motor commands", True, (245, 190, 90)), (16, 68))
+            screen.blit(font.render("45deg crab / hold", True, (160, 210, 235)), (650, 76))
+            for (label, forward, turn), rect in zip(DIRECTION_BUTTONS, direction_buttons):
+                selected = mouse_direction == (forward, turn)
+                pygame.draw.rect(screen, (35, 115, 155) if selected else (55, 55, 65), rect, border_radius=5)
+                text = font.render(label, True, (230, 230, 240))
+                screen.blit(text, text.get_rect(center=rect.center))
             for mult, rect in zip(FORWARD_SPEED_CHOICES, speed_buttons):
                 selected = mult == forward_multiplier
                 pygame.draw.rect(screen, (35, 115, 155) if selected else (55, 55, 65), rect,
@@ -358,7 +402,7 @@ def run(args):
                 label = font.render(f"{mult}x   {args.max_lin * mult:.2f} m/s", True,
                                     (245, 245, 250) if selected else (170, 170, 180))
                 screen.blit(label, label.get_rect(center=rect.center))
-            speed_text = (f"Space speed: {forward_multiplier}x ({args.max_lin * forward_multiplier:.2f} m/s)"
+            speed_text = (f"Drive speed: {forward_multiplier}x ({args.max_lin * forward_multiplier:.2f} m/s)"
                           " | 1 / 2 / 3 or click")
             screen.blit(font.render(speed_text, True, (160, 210, 235)), (16, 380))
             if tlm_mode:
@@ -376,7 +420,9 @@ def run(args):
         for _ in range(5):
             send(0.0, 0.0, 0.0)
             time.sleep(0.02)
-        if ros_mode:
+        if demo_mode:
+            pass
+        elif ros_mode:
             sink.close()
         elif getattr(args, "udp", None):
             usock.close()
@@ -389,6 +435,7 @@ def run(args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--demo", action="store_true", help="화면과 입력만 시연 · 네트워크/시리얼/SPI/ROS 출력 없음")
     ap.add_argument("--port", default="/dev/ttyACM0",
                     help="serial device to the Nucleo (ST-Link VCP is usually /dev/ttyACM0)")
     ap.add_argument("--baud", type=int, default=115200)
@@ -409,9 +456,9 @@ def main():
                     help="serial 대신 ROS2 Twist 를 /cmd_vel 로 발행")
     ap.add_argument("--topic", default="/cmd_vel", help="--ros 발행 토픽")
     ap.add_argument("--max-lin", type=float, default=0.5,
-                    help="pad limit and 1x Space speed in m/s; Space selector allows up to 3x")
+                    help="pad limit and 1x keyboard/button speed in m/s; selector allows up to 3x")
     ap.add_argument("--max-ang", type=float, default=2.0,
-                    help="rotation reference in rad/s; pad and Q/E send 50%% of this value")
+                    help="rotation reference in rad/s; all controls send 50%% of this value")
     ap.add_argument("--deadzone", type=float, default=0.1,
                     help="패드 중심 데드존 (반경 비율). 중심 근처 손떨림이 바퀴 방향을 "
                          "홱홱 돌리지 않게 한다. 0 이면 끔")

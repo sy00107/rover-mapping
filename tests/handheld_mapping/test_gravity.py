@@ -261,29 +261,26 @@ def test_terrain_outputs_keep_gravity_provenance_and_preserve_earlier_revision(g
     assert (output/'terrain.npz').read_bytes()==original
 
 
-def test_qt_gravity_selection_requires_imu_and_is_locked_during_capture(tmp_path,monkeypatch):
+def test_qt_gravity_is_automatic_for_real_capture(tmp_path, monkeypatch):
     from PyQt5.QtWidgets import QApplication
     from experiments.handheld_mapping import app as mapping_app
     from experiments.handheld_mapping.controller import Session
-    monkeypatch.setattr(mapping_app,'ROOT',tmp_path)
-    app=QApplication.instance() or QApplication([])
-    session=Session(); window=mapping_app.MappingWindow(session)
+    app = QApplication.instance() or QApplication([])
+    session = Session()
+    settings = []
+    monkeypatch.setattr(session, 'start', settings.append)
+    window = mapping_app.MappingWindow(session, output_root=tmp_path)
     try:
-        window.show(); app.processEvents()
-        assert not window.grab().isNull()
-        window.grab().save(str(tmp_path/'gravity-ui.png'))
-        assert not window.gravity_enabled.isEnabled()
-        window.imu_enabled.setChecked(True); window.refresh()
-        assert window.gravity_enabled.isEnabled()
-        window.gravity_enabled.setChecked(True)
-        session.update(state='recording'); window.refresh()
-        assert not window.gravity_enabled.isEnabled()
-        session.update(state='idle'); window.demo.setChecked(True); window.refresh()
-        assert not window.gravity_enabled.isChecked()
-        assert not window.gravity_enabled.isEnabled()
+        window.start()
+        assert settings[-1]['gravity_enabled'] is True
+        assert settings[-1]['imu_enabled'] is True
+        window.demo = True
+        window.start()
+        assert settings[-1]['gravity_enabled'] is False
+        assert settings[-1]['imu_enabled'] is False
         app.processEvents()
     finally:
-        session.update(state='idle'); window.close()
+        window.close()
 
 
 def test_failed_reference_is_not_reused_during_partial_reconstruction(gravity_run):

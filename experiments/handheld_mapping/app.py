@@ -4,6 +4,7 @@
 # 사용법: bash tools/handheld_mapping.sh [--demo]
 # ================================================================
 import argparse
+import json
 import os
 from pathlib import Path
 import sys
@@ -27,8 +28,10 @@ class MappingWindow(QWidget):
         super().__init__()
         self.session = session
         self.close_pending = False
+        self.opened_transfer_attempts = set()
+        self.transfer_terminal_process = None
         self.setWindowTitle("D435 · Handheld Mapping")
-        self.resize(1200, 980)
+        self.resize(1200, 900)
         self.setStyleSheet("""
             QWidget { background:#111820; color:#e8edf2; font-size:14px; }
             QLineEdit,QComboBox { background:#1b2733; border:1px solid #344556; border-radius:6px; padding:9px; }
@@ -47,81 +50,66 @@ class MappingWindow(QWidget):
         heading = QLabel("D435  /  HANDHELD MAPPING")
         heading.setObjectName("heading")
         layout.addWidget(heading)
-        layout.addWidget(QLabel("노트북 원본 저장  ·  ORB 위치추정  ·  종료 후 TSDF 표면 생성"))
+        layout.addWidget(QLabel("Pi 원본 저장 · 실시간 미리보기 · 종료 후 원본 전송과 지도 생성"))
         fields = QGridLayout()
         fields.setVerticalSpacing(2)
         self.host = QLineEdit("pi@raspberrypi.local")
         self.output = QLineEdit(str(output_root or ROOT / "outputs/handheld_mapping/sessions"))
-        self.mode = QComboBox()
-        self.mode.addItem("ORB-SLAM3 + TSDF", False)
-        line_runner = ROOT / "outputs/handheld_mapping/orbline_build/rover_orbline"
-        self.mode.addItem("ORB + TSDF → 점+선 비교 (촬영 후 노트북)", True)
-        self.mode.model().item(1).setEnabled(line_runner.is_file())
-        self.demo = QCheckBox("합성 입력으로 시험 (카메라 연결 없음)")
-        self.demo.setChecked(demo)
+        # Capture policy is fixed; synthetic/fusion experiments remain CLI-only.
+        self.demo = demo
+        self.inertial_fusion = inertial_fusion and not demo
         self.point_ready = (ROOT/'outputs/handheld_mapping/orb3_comparison_build/rover_orb3_compare').is_file()
-        self.sensors_only = QCheckBox('Pi는 센서 전송만 · 종료 후 노트북에서 ORB 계산')
-        self.sensors_only.setChecked(self.point_ready)
-        self.sensors_only.setToolTip('Pi에 Atlas를 만들지 않습니다. 노트북 native ORB 실행기가 필요합니다.')
-        self.live_mapping = QCheckBox('실시간 촬영 범위 표시 · 노트북에서 ORB 동시 실행')
-        self.live_mapping.setChecked(self.point_ready)
-        self.live_mapping.setToolTip('원본 저장과 별도로 최신 입력을 추적하며 종료 후 최종 지도를 다시 계산합니다.')
         calibration = imu_calibration or ROOT / "outputs/handheld_mapping/calibration/imu_calibration.json"
-        self.imu_enabled = QCheckBox("보정 IMU 함께 기록")
-        self.imu_enabled.setChecked(calibration.expanduser().is_file() and not demo)
-        self.imu_enabled.setToolTip("raw·보정 IMU를 원본 영상과 같은 폴더에 저장합니다. ORB 융합과 시계 동기화는 검증되지 않았습니다.")
         self.imu_calibration = QLineEdit(str(calibration))
-        self.inertial_fusion = QCheckBox('종료 후 IMU 융합 시험')
-        self.inertial_fusion.setToolTip('촬영 중에는 기존 stereo를 사용하고 종료 후 시간 정렬·관성 지도를 별도로 계산합니다.')
-        self.inertial_fusion.setChecked(inertial_fusion and not demo)
-        if self.inertial_fusion.isChecked():
-            self.imu_enabled.setChecked(True)
-        self.inertial_fusion.toggled.connect(lambda checked: self.imu_enabled.setChecked(True) if checked else None)
-        self.imu_enabled.toggled.connect(lambda checked: self.inertial_fusion.setChecked(False) if not checked else None)
         self.imu_zero_button = QPushButton('평지 영점')
         self.imu_zero_button.setToolTip('알려진 평지에서 3초 정지한 뒤 누르세요. IMU 참고 각도의 표시 영점만 설정하며 지도와 센서 보정값은 바꾸지 않습니다.')
         self.imu_zero_button.clicked.connect(self.zero_imu_display)
-        self.gravity_enabled = QCheckBox('중력 기준 지도와 높이·경사·단차 생성 · 시작 시 3초 정지')
-        self.gravity_enabled.setChecked(self.imu_enabled.isChecked())
-        self.gravity_enabled.setToolTip('정지 IMU와 카메라 장착 모델로 위쪽을 정합니다. 동적 IMU 융합과 실측 경사 검증은 별도입니다.')
         fields.addWidget(QLabel("Pi 연결"), 0, 0)
         fields.addWidget(self.host, 0, 1)
-        fields.addWidget(QLabel("저장 폴더"), 1, 0)
-        fields.addWidget(self.output, 1, 1)
+        fields.addWidget(self.imu_zero_button, 0, 2)
+        fields.setColumnStretch(1, 1)
+        layout.addLayout(fields)
+        policy = QLabel("영상 + IMU 자동 기록  ·  종료 후 PC에서 지도 생성  ·  Pi는 검증 후 최신 촬영 보관")
+        policy.setStyleSheet("color:#80d5bb; padding:6px 0;")
+        layout.addWidget(policy)
+        layout.addWidget(QLabel("촬영 시작 후 평지에서 3초간 멈춰 주세요."))
+        self.settings_button = QPushButton("세부 설정 ▸")
+        self.settings_button.setCheckable(True)
+        layout.addWidget(self.settings_button, alignment=Qt.AlignLeft)
+        self.settings_panel = QWidget()
+        settings = QVBoxLayout(self.settings_panel)
+        settings.setContentsMargins(0, 4, 0, 8)
+        paths = QGridLayout()
+        paths.addWidget(QLabel("저장 폴더"), 0, 0)
+        paths.addWidget(self.output, 0, 1)
         choose = QPushButton("선택")
         choose.clicked.connect(self.choose_output)
-        fields.addWidget(choose, 1, 2)
-        fields.addWidget(QLabel("처리 방식"), 2, 0)
-        fields.addWidget(self.mode, 2, 1)
-        fields.addWidget(self.demo, 3, 1)
-        fields.addWidget(self.sensors_only, 4, 1)
-        fields.addWidget(self.live_mapping, 5, 1)
-        fields.addWidget(self.imu_enabled, 6, 1)
-        fields.addWidget(QLabel("IMU 보정 파일"), 7, 0)
-        fields.addWidget(self.imu_calibration, 7, 1)
-        fields.addWidget(self.imu_zero_button,7,2)
-        fields.addWidget(self.gravity_enabled,8,1)
-        fields.addWidget(self.inertial_fusion,9,1)
         self.choose_button = choose
-        layout.addLayout(fields)
+        paths.addWidget(choose, 0, 2)
+        paths.addWidget(QLabel("IMU 보정 파일"), 1, 0)
+        paths.addWidget(self.imu_calibration, 1, 1, 1, 2)
+        settings.addLayout(paths)
+        self.settings_panel.hide()
+        self.settings_button.toggled.connect(self.toggle_settings)
+        layout.addWidget(self.settings_panel)
         self.status_label = QLabel("준비 · 시작 버튼을 누르세요")
         self.status_label.setObjectName("status")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
         self.metrics = QLabel("촬영 시간 00:00   |   저장 프레임 0   |   추적 대기")
         layout.addWidget(self.metrics)
-        self.imu_status = QLabel("IMU 기록 꺼짐 · ORB 융합 안 함 · 시계 동기화 미검증")
+        self.imu_status = QLabel("IMU · 촬영 시작 대기")
         self.imu_status.setWordWrap(True)
         layout.addWidget(self.imu_status)
         self.preview = QLabel("카메라 미리보기\n촬영을 시작하면 좌측 IR 영상이 표시됩니다")
         self.preview.setObjectName("preview")
         self.preview.setAlignment(Qt.AlignCenter)
-        self.preview.setMinimumHeight(120)
+        self.preview.setMinimumHeight(100)
         self.preview.setSizePolicy(QSizePolicy.Ignored,QSizePolicy.Ignored)
         self.overlay_preview = QLabel('촬영하면 관측 횟수 색이 영상 위에 표시됩니다')
         self.overlay_preview.setObjectName('preview')
         self.overlay_preview.setAlignment(Qt.AlignCenter)
-        self.overlay_preview.setMinimumHeight(120)
+        self.overlay_preview.setMinimumHeight(100)
         self.overlay_preview.setSizePolicy(QSizePolicy.Ignored,QSizePolicy.Ignored)
         self.overlay_note = QLabel('관측 횟수 오버레이 · 노랑 적음 / 초록 여러 시점')
         self.overlay_note.setWordWrap(True)
@@ -139,6 +127,10 @@ class MappingWindow(QWidget):
         self.path_label = QLabel("매번 새 날짜별 폴더를 만들며 기존 기록을 덮어쓰지 않습니다")
         self.path_label.setWordWrap(True)
         layout.addWidget(self.path_label)
+        self.retention_status = QLabel()
+        self.retention_status.setWordWrap(True)
+        self.retention_status.hide()
+        layout.addWidget(self.retention_status)
         viewing = QHBoxLayout()
         viewing.addWidget(QLabel('3D 보기 설정'))
         self.view_backend = QComboBox()
@@ -163,7 +155,7 @@ class MappingWindow(QWidget):
         viewing.addStretch()
         self.view_depth.currentIndexChanged.connect(
             lambda _: self.view_cleanup.setEnabled(self.view_depth.currentData() is not None))
-        layout.addLayout(viewing)
+        settings.addLayout(viewing)
         controls = QHBoxLayout()
         self.start_button, self.stop_button = QPushButton("매핑 시작"), QPushButton("종료 및 지도 생성")
         self.start_button.setObjectName("start")
@@ -178,20 +170,33 @@ class MappingWindow(QWidget):
         for button in (self.start_button, self.stop_button, self.view_button, self.terrain_button, self.open_button, self.rebuild_button):
             controls.addWidget(button)
         layout.addLayout(controls)
-        layout.addWidget(self.joined_export_button)
+        recovery_controls = QHBoxLayout()
+        self.pause_button = QPushButton('전송 보류 · 나중에 이어받기')
+        self.resume_button = QPushButton('중단된 원본 이어받기')
+        self.transfer_terminal_button = QPushButton('전송 창 열기')
+        self.transfer_terminal_button.clicked.connect(self.open_transfer_terminal)
+        self.pause_button.clicked.connect(session.pause_transfer)
+        self.resume_button.clicked.connect(self.resume_transfer)
+        recovery_controls.addWidget(self.pause_button)
+        recovery_controls.addWidget(self.resume_button)
+        recovery_controls.addWidget(self.transfer_terminal_button)
+        recovery_controls.addWidget(self.joined_export_button)
+        layout.addLayout(recovery_controls)
         self.start_button.clicked.connect(self.start)
         self.stop_button.clicked.connect(session.stop)
         self.open_button.clicked.connect(self.open_folder)
         self.rebuild_button.clicked.connect(self.rebuild)
         self.view_button.clicked.connect(self.view_map)
         self.terrain_button.clicked.connect(self.view_terrain)
-        layout.addWidget(QLabel("입력 요청15 FPS · projector OFF · 1cm voxel · 지도별 별도 저장 | 실기 depth 추가 부하는 연결 후 확인"))
+        settings.addWidget(QLabel("15 FPS · 1cm 지도 격자 · 원본과 생성 지도는 별도 보관"))
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(200)
-        self.demo.toggled.connect(self.refresh)
-        self.imu_enabled.toggled.connect(self.refresh)
         self.refresh()
+
+    def toggle_settings(self, expanded: bool) -> None:
+        self.settings_panel.setVisible(expanded)
+        self.settings_button.setText("세부 설정 ▾" if expanded else "세부 설정 ▸")
 
     def choose_output(self) -> None:
         selected = QFileDialog.getExistingDirectory(self, "노트북 저장 폴더", self.output.text())
@@ -201,12 +206,12 @@ class MappingWindow(QWidget):
     def start(self) -> None:
         try:
             self.session.start({"host": self.host.text().strip(), "output_root": self.output.text(),
-                                "demo": self.demo.isChecked(), "compare_lines": self.mode.currentData(),
-                                "sensors_only": self.sensors_only.isChecked(),
-                                "live_mapping": self.live_mapping.isChecked(),
-                                "imu_enabled": self.imu_enabled.isChecked() and not self.demo.isChecked(),
-                                "gravity_enabled":self.gravity_enabled.isChecked(),
-                                "inertial_fusion":self.inertial_fusion.isChecked() and not self.demo.isChecked(),
+                                "demo": self.demo, "compare_lines": False,
+                                "sensors_only": True,
+                                "live_mapping": self.point_ready,
+                                "imu_enabled": not self.demo,
+                                "gravity_enabled": not self.demo,
+                                "inertial_fusion": self.inertial_fusion,
                                 "imu_calibration": self.imu_calibration.text().strip()})
         except Exception as error:
             self.status_label.setText(str(error))
@@ -216,6 +221,27 @@ class MappingWindow(QWidget):
         path = self.session.snapshot()["run_dir"]
         if path:
             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def open_transfer_terminal(self) -> None:
+        from experiments.handheld_mapping.transfer_monitor import launch_terminal
+        run_dir = self.session.snapshot()['run_dir']
+        if not run_dir:
+            return
+        try:
+            self.transfer_terminal_process = launch_terminal(Path(run_dir))
+            self.session.update(transfer_terminal_warning=None)
+        except OSError as error:
+            self.session.update(transfer_terminal_warning=str(error))
+
+    def resume_transfer(self) -> None:
+        current = self.session.snapshot()
+        selected = current['run_dir'] if current['state'] == 'paused' else QFileDialog.getExistingDirectory(
+            self, '이어받을 기존 촬영 폴더', self.output.text())
+        if selected:
+            try:
+                self.session.resume_transfer(Path(selected))
+            except Exception as error:
+                self.status_label.setText(str(error))
 
     def zero_imu_display(self) -> None:
         try:
@@ -326,29 +352,38 @@ class MappingWindow(QWidget):
         status = self.session.snapshot()
         active = status["state"] in ACTIVE or (self.session.thread is not None and self.session.thread.is_alive())
         active = active or self.export_process is not None
+        progress_path = Path(status['run_dir'])/'transfer_status.json' if status['run_dir'] else None
+        self.transfer_terminal_button.setEnabled(bool(progress_path and progress_path.is_file()))
+        if (status.get('local_recording') and progress_path and progress_path.is_file()):
+            try:
+                progress = json.loads(progress_path.read_text())
+                attempt = (status['run_dir'], progress['attempt'])
+                if (progress.get('phase') in {'transferring', 'importing', 'verifying', 'complete', 'paused', 'failed'}
+                        and attempt not in self.opened_transfer_attempts):
+                    self.opened_transfer_attempts.add(attempt)
+                    self.open_transfer_terminal()
+            except (OSError, ValueError, KeyError):
+                pass
+        if self.transfer_terminal_process is not None and self.transfer_terminal_process.poll() is not None:
+            if self.transfer_terminal_process.returncode:
+                self.session.update(transfer_terminal_warning='전송 터미널을 열지 못했습니다. 앱의 전송률 또는 transfer_terminal.log를 확인하세요.')
+            self.transfer_terminal_process = None
         self.joined_export_button.setEnabled(not active)
         self.start_button.setEnabled(not active)
         self.stop_button.setEnabled(status["state"] in {"starting", "recording"})
+        self.pause_button.setEnabled(bool(status.get('local_recording')) and
+            status['state'] in {'stopping','finalizing','transferring'})
+        self.resume_button.setEnabled(not active)
         self.rebuild_button.setEnabled(not active)
         self.view_button.setEnabled(not active)
         self.terrain_button.setEnabled(not active)
         self.open_button.setEnabled(bool(status["run_dir"]))
-        for widget in (self.host, self.output, self.mode, self.demo, self.choose_button):
+        for widget in (self.host, self.output, self.choose_button):
             widget.setEnabled(not active)
-        self.sensors_only.setEnabled(not active and self.point_ready)
-        self.live_mapping.setEnabled(not active and self.point_ready)
-        if self.demo.isChecked():
-            self.inertial_fusion.setChecked(False)
-            self.imu_enabled.setChecked(False)
-        self.inertial_fusion.setEnabled(not active and not self.demo.isChecked())
-        self.imu_enabled.setEnabled(not active and not self.demo.isChecked())
-        self.imu_calibration.setEnabled(not active and not self.demo.isChecked())
-        if not self.imu_enabled.isChecked() or self.demo.isChecked():
-            self.gravity_enabled.setChecked(False)
-        self.gravity_enabled.setEnabled(not active and self.imu_enabled.isChecked() and not self.demo.isChecked())
+        self.imu_calibration.setEnabled(not active and not self.demo)
         imu = status.get("imu")
         self.imu_zero_button.setEnabled(status['state']=='recording' and bool(imu) and not imu.get('stale',True))
-        imu_text = "IMU 유효 샘플 대기" if self.imu_enabled.isChecked() else "IMU 기록 꺼짐"
+        imu_text = "IMU · 촬영 시작 시 자동 수집" if not self.demo else "합성 입력 · IMU 없음"
         if imu:
             imu_text = (f"IMU 기록 {imu.get('state', '대기')} · 유효 {imu.get('valid', 0)}"
                         f" · 고유 {imu.get('unique', 0)} / {imu.get('hz', 0):.1f} Hz")
@@ -366,16 +401,17 @@ class MappingWindow(QWidget):
         gravity = status.get('gravity')
         if gravity:
             imu_text += f" · 중력 기준 {len(gravity.get('maps',{}))}개 지도 / {gravity['status']}"
-        elif self.gravity_enabled.isChecked():
+        elif not self.demo:
             imu_text += ' · 중력 기준 준비: 촬영 시작 후 3초간 정지'
         fusion_text = 'ORB 융합 안 함'
         if status.get('inertial_warning'):
             fusion_text = status['inertial_warning']
         elif status.get('inertial_dense', {}).get('status') == 'complete':
             fusion_text = 'IMU 융합 지도 저장'
-        elif self.inertial_fusion.isChecked():
+        elif self.inertial_fusion:
             fusion_text = '종료 후 IMU 융합 시험'
-        self.imu_status.setText(imu_text+' · '+fusion_text+' · 시계 동기화 미검증')
+        self.imu_status.setText(imu_text)
+        self.imu_status.setToolTip(fusion_text+' · 영상과 IMU의 시계 동기화는 미검증')
         live = self.session.live_snapshot()
         if live and live.get('body_attitude') and not live.get('stale') and live.get('tracking_state') == 2:
             body = live['body_attitude']
@@ -385,8 +421,10 @@ class MappingWindow(QWidget):
         label = status["message"]
         if self.close_pending and active:
             label = "저장이 끝나면 창을 닫습니다 · "+label
-        if self.demo.isChecked():
+        if self.demo:
             label = "[합성 시험] "+label
+        if status.get('transfer_terminal_warning'):
+            label += ' · '+status['transfer_terminal_warning']
         self.status_label.setText(label)
         elapsed = int(status["elapsed_s"])
         counts = status.get("counts", {})
@@ -399,6 +437,26 @@ class MappingWindow(QWidget):
         self.metrics.setText(f"시간 {elapsed//60:02d}:{elapsed%60:02d}  |  저장 IR {counts.get('left', 0)}/{counts.get('right', 0)}"
                              f" · depth {counts.get('depth', 0)}  |  수신 {status.get('left_receipt_fps', 0):.1f} FPS"
                              f"  |  추적 {tracking}  |  전송 누락 {status.get('dropped', 0)}")
+        if status.get('local_recording'):
+            pi = status.get('pi_recording', {})
+            fps = pi.get('recording_fps', {}).get('left', 0.)
+            self.metrics.setText(self.metrics.text()+f" | Pi 기록 {fps:.1f} FPS · 여유 {pi.get('disk_free_bytes', 0)/1e9:.1f} GB")
+        retention = status.get('pi_retention')
+        self.retention_status.setVisible(bool(retention))
+        if retention:
+            if retention['status'] == 'deferred':
+                text = 'Pi 원본 정리 보류 · '+retention['reason']
+                color = '#e4be7a'
+            else:
+                extra = {row['run_id'] for key in ('skipped', 'local_skipped', 'unverified_retained')
+                         for row in retention.get(key, [])}
+                text = f"Pi 과거 원본 {len(retention.get('deleted', []))}개 정리 · 최신 촬영 보관"
+                if extra:
+                    text += f' · 미검증·이상 촬영 {len(extra)}개 추가 보존'
+                color = '#e4be7a' if extra else '#80d5bb'
+            self.retention_status.setText(text)
+            self.retention_status.setStyleSheet('color:'+color)
+            self.retention_status.setToolTip(json.dumps(retention, ensure_ascii=False, indent=2))
         if status["run_dir"]:
             self.path_label.setText(status["run_dir"])
         with self.session.lock:
@@ -449,7 +507,10 @@ class MappingWindow(QWidget):
         active = self.session.snapshot()["state"] in ACTIVE or (self.session.thread is not None and self.session.thread.is_alive())
         if active:
             self.close_pending = True
-            self.session.stop()
+            if self.session.snapshot().get('local_recording') and self.session.snapshot()['state'] in {'stopping','finalizing','transferring'}:
+                self.session.pause_transfer()
+            else:
+                self.session.stop()
             event.ignore()
         else:
             event.accept()

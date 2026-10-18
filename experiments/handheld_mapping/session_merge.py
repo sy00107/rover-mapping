@@ -21,15 +21,17 @@ from experiments.handheld_mapping.terrain_replay import project_depth, save_grid
 from experiments.handheld_mapping.costmap import RoverLimits
 
 
-def validated_sources(reference: Path, reports: list[dict]) -> list[dict]:
+def validated_sources(reference: Path, reports: list[dict], reference_map_id: int = 0) -> list[dict]:
     """Reject unverified/changed registrations before creating output geometry."""
     reference = Path(reference).resolve()
-    sources = [{'run':reference, 'registration':np.eye(4), 'report':None}]
-    seen = {(reference,0)}
+    if type(reference_map_id) is not int or reference_map_id<0:raise ValueError('invalid reference map ID')
+    sources = [{'run':reference, 'registration':np.eye(4), 'report':None,'map_id':reference_map_id}]
+    seen = {(reference,reference_map_id)}
     for report in reports:
         run = Path(report['source']).resolve()
         map_id = report.get('source_map_id',0)
-        if (run,map_id) in seen or Path(report['reference']).resolve() != reference:
+        if ((run,map_id) in seen or Path(report['reference']).resolve() != reference
+                or report.get('reference_map_id',0)!=reference_map_id):
             raise ValueError('duplicate source or different registration reference')
         held = report.get('held_out_reprojection_p50_p90_px', [])
         if (report.get('method') != 'mutual_RootSIFT_metric_depth_PnP_multiview_reprojection'
@@ -48,8 +50,8 @@ def validated_sources(reference: Path, reports: list[dict]) -> list[dict]:
             raise ValueError('source gravity incompatible with reference')
         required = {str(root/name) for root in [run, reference] for name in
                     ('frames.jsonl','capture_calibration.json')}
-        required.update([str(reference/'orb_offline/map_0_keyframes.csv'),
-                         str(reference/'gravity/orb_offline/map_0.json'),
+        required.update([str(reference/f'orb_offline/map_{reference_map_id}_keyframes.csv'),
+                         str(reference/f'gravity/orb_offline/map_{reference_map_id}.json'),
                          str(run/f'orb_offline/map_{map_id}_keyframes.csv')])
         if frame == 'gravity':required.add(str(run/f'gravity/orb_offline/map_{map_id}.json'))
         hashes = report.get('source_sha256', {})
@@ -83,10 +85,18 @@ def validated_sources(reference: Path, reports: list[dict]) -> list[dict]:
 
 
 def fuse_sessions(reference: Path, reports: list[dict], output: Path, depth_max: float = 2.,
-                  voxel_size: float = .01, progress=print, cross_session_filter: bool = False) -> dict:
-    import open3d as o3d
+                  voxel_size: float = .01, progress=print, cross_session_filter: bool = False, reference_map_id: int = 0) -> dict:
     reference, output = Path(reference).resolve(), Path(output).resolve()
-    sources = validated_sources(reference, reports)
+    sources = validated_sources(reference, reports,reference_map_id)
+    return _fuse_sources(reference, sources, output, depth_max, voxel_size, progress,
+                         cross_session_filter, reference_map_id, reports)
+
+
+def _fuse_sources(reference, sources, output, depth_max, voxel_size, progress,
+                  cross_session_filter, reference_map_id, reports,
+                  method='registered_sessions_original_depth_TSDF'):
+    """Integrate prepared metric camera poses; callers provide their validation evidence."""
+    import open3d as o3d
     if (not math.isfinite(depth_max) or not .3 < depth_max <= 10
             or not math.isfinite(voxel_size) or not .002 <= voxel_size <= .1):
         raise ValueError('invalid depth/voxel bounds')
@@ -94,8 +104,8 @@ def fuse_sessions(reference: Path, reports: list[dict], output: Path, depth_max:
         raise ValueError('merged output must be outside original sessions')
     if type(cross_session_filter) is not bool:raise ValueError('cross_session_filter must be boolean')
     output.mkdir(parents=True, exist_ok=False)
-    result = {'schema':1,'status':'building','method':'registered_sessions_original_depth_TSDF',
-              'reference':str(reference),'depth_max_m':depth_max,'voxel_size_m':voxel_size,
+    result = {'schema':1,'status':'building','method':method,
+              'reference':str(reference),'reference_map_id':reference_map_id,'depth_max_m':depth_max,'voxel_size_m':voxel_size,
               'coordinate_system':'reference session stationary IMU gravity frame',
               'source_runs':list(dict.fromkeys(str(s['run']) for s in sources)), 'registrations':reports,
               'raw_preserved':True,'accuracy_verified':False,'orb_fused':False}
@@ -194,7 +204,7 @@ def fuse_sessions(reference: Path, reports: list[dict], output: Path, depth_max:
                 raise OSError('merged geometry write failed')
         total = sum(row['keyframes'] for row in counts)
         dense = {'status':'complete' if total==len(cameras) else 'partial',
-                 'method':'multi_session_keyframe_TSDF','depth_max_m':depth_max,'voxel_size_m':voxel_size,
+                 'method':method,'depth_max_m':depth_max,'voxel_size_m':voxel_size,
                  'depth_filter':filter_metadata,'coordinate_system':'gravity_z_up',
                  'maps':[{'map_id':0,'keyframes':total,'integrated_frames':len(cameras),
                           'unintegrated_keyframes':total-len(cameras),'vertices':len(mesh.vertices),
@@ -210,7 +220,7 @@ def fuse_sessions(reference: Path, reports: list[dict], output: Path, depth_max:
              'depth_max_m':depth_max,'depth_filter':filter_metadata,
              'source_sha256':{name:fingerprint(output/name) for name in
                              ('capture_calibration.json','orb_offline/map_0_keyframes.csv')},
-             'alignment_metadata':{'method':'image_verified_multisession_gravity_registration',
+             'alignment_metadata':{'method':method,
                                    'imu_clock_verified':False,'extrinsic_verified':False,'orb_fused':False}})
         for name, expected in input_hashes.items():
             if fingerprint(Path(name)) != expected:
@@ -235,6 +245,7 @@ def fuse_sessions(reference: Path, reports: list[dict], output: Path, depth_max:
 def main():
     parser=argparse.ArgumentParser(description='검증된 촬영들의 원본 깊이로 별도 통합 지도 생성')
     parser.add_argument('--reference',required=True,type=Path)
+    parser.add_argument('--reference-map-id',type=int,default=0)
     parser.add_argument('--registration',required=True,type=Path,action='append')
     parser.add_argument('--output',required=True,type=Path)
     parser.add_argument('--depth-max',type=float,default=2.)
@@ -243,7 +254,7 @@ def main():
     args=parser.parse_args()
     reports=[json.loads(path.read_text()) for path in args.registration]
     result=fuse_sessions(args.reference,reports,args.output,args.depth_max,
-                         cross_session_filter=args.cross_session_filter)
+                         cross_session_filter=args.cross_session_filter,reference_map_id=args.reference_map_id)
     print(json.dumps({key:result[key] for key in ('status','source_runs','additional_observed_xy_5cm_cells')},indent=2))
 
 

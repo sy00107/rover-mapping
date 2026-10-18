@@ -167,23 +167,16 @@ def test_qt_imu_defaults_demo_toggle_and_recording_status(tmp_path, monkeypatch)
     session = Session()
     window = mapping_app.MappingWindow(session)
     try:
-        assert window.imu_enabled.isChecked()
+        assert not window.demo
         assert window.imu_calibration.text() == str(calibration)
-        window.demo.setChecked(True)
-        window.refresh()
-        assert not window.imu_enabled.isChecked()
-        assert not window.imu_enabled.isEnabled()
-        window.demo.setChecked(False)
-        window.imu_enabled.setChecked(True)
         session.update(state="recording", imu=dict(valid=24, unique=20, hz=100., stale=True,
                                                    roll_deg=2., pitch_deg=-1., orb_fused=False))
         window.refresh()
-        assert not window.imu_enabled.isEnabled()
         assert not window.imu_calibration.isEnabled()
         assert "20" in window.imu_status.text()
         assert "100.0" in window.imu_status.text()
         assert "지연" in window.imu_status.text()
-        assert "ORB 융합 안 함" in window.imu_status.text()
+        assert "ORB 융합 안 함" in window.imu_status.toolTip()
         app.processEvents()
     finally:
         session.update(state="idle")
@@ -198,14 +191,12 @@ def test_qt_start_records_enabled_imu_in_camera_session(tmp_path, imu_boundary, 
     original_start = session.start
 
     def local_camera(settings: dict) -> None:
-        original_start({**settings, "worker_command": config(tmp_path)["worker_command"]})
+        original_start({**settings, "gravity_enabled": False, "worker_command": config(tmp_path)["worker_command"]})
 
     monkeypatch.setattr(session, "start", local_camera)
     window = MappingWindow(session, output_root=tmp_path)
-    window.imu_enabled.setChecked(True)
     window.imu_calibration.setText(str(tmp_path / "calibration.json"))
     # 이 시험은 IMU 동시 기록만 격리한다. 정지 기준/장착 데이터는 제공하지 않는다.
-    window.gravity_enabled.setChecked(False)
     try:
         window.start_button.click()
         wait_state(session, {"recording"})

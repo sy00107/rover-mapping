@@ -219,3 +219,42 @@ def test_persistent_single_recording_depth_spike_is_rejected_by_other_recording(
     ref=next(x for x in result['source_counts'] if Path(x['source'])==reference)
     assert ref['cross_session_stats']['rejected_conflict_pixels']>50
     assert ref['cross_session_stats']['confirmed_other_session_pixels']>1000
+
+
+def test_nonzero_reference_fragment_uses_its_pose_and_gravity(two_sessions):
+    reference,source,report=two_sessions
+    old=reference/'orb_offline/map_0_keyframes.csv';new=old.with_name('map_5_keyframes.csv')
+    text=old.read_text().splitlines();new.write_text(text[0]+'\n'+'\n'.join('5,'+line.split(',',1)[1] for line in text[1:])+'\n');old.unlink()
+    old=reference/'gravity/orb_offline/map_0.json';new=old.with_name('map_5.json')
+    data=json.loads(old.read_text());data['map_id']=5
+    # Alignment input provenance follows the renamed source keyframe snapshot.
+    hashes=data.get('source_sha256',{})
+    if 'orb_offline/map_0_keyframes.csv' in hashes:
+        hashes.pop('orb_offline/map_0_keyframes.csv');hashes['orb_offline/map_5_keyframes.csv']=fingerprint(reference/'orb_offline/map_5_keyframes.csv')
+    new.write_text(json.dumps(data));old.unlink()
+    report['reference_map_id']=5
+    report['source_sha256']={str(run/name):fingerprint(run/name) for run in [reference,source]
+        for name in ['frames.jsonl','capture_calibration.json',
+                     'orb_offline/map_5_keyframes.csv' if run==reference else 'orb_offline/map_0_keyframes.csv',
+                     'gravity/orb_offline/map_5.json' if run==reference else 'gravity/orb_offline/map_0.json']}
+    sources=validated_sources(reference,[report],reference_map_id=5)
+    assert any(item['run']==reference.resolve() and item['map_id']==5 for item in sources)
+    with pytest.raises(ValueError,match='reference'):
+        validated_sources(reference,[report],reference_map_id=0)
+
+
+def test_held_out_target_selection_uses_match_strength_not_fit_error():
+    pairs,source,target,truth=visual_evidence()
+    # A weak wrong retrieval candidate does not count as a second independent held-out view.
+    for pair in list(pairs):
+        if pair['source_index'] in {0,3}:
+            wrong={**pair,'target_index':99,'inliers':15,'target_uv':pair['target_uv']+50}
+            pairs.append(wrong)
+    result,report=fit_visual_pairs(pairs,source,target,{0,3})
+    np.testing.assert_allclose(result,truth,atol=.002)
+    assert report['held_out_image_pairs']==2
+    # A stronger wrong match MUST fail, even when a weaker candidate fits the answer.
+    for pair in pairs:
+        if pair['target_index']==99:pair['inliers']=81
+    with pytest.raises(ValueError,match='held-out'):
+        fit_visual_pairs(pairs,source,target,{0,3})

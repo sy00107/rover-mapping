@@ -124,7 +124,10 @@ class ImuCapture:
 
     def __init__(self, host: str, run: Path, calibration_path: Path, urdf_path: Path,
                  socket_path: str = '/dev/shm/rover-mapping-imu.sock',
-                 command: list[str] | None = None) -> None:
+                 command: list[str] | None = None, receipt_device: str = 'laptop') -> None:
+        if receipt_device not in ('laptop', 'pi'):
+            raise ValueError('invalid receipt device')
+        self.receipt_device = receipt_device
         if not re.fullmatch(r'[A-Za-z0-9_.@:-]+', host) or host.startswith('-'):
             raise ValueError('invalid SSH host')
         if not socket_path.startswith('/') or '\x00' in socket_path:
@@ -134,6 +137,8 @@ class ImuCapture:
         remote = f'/dev/shm/rover_mapping_{self.run.name}/code'
         script = (f'set -e; cd {shlex.quote(remote)}; '
                   'export PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1; '
+                  '/usr/bin/python3 -m experiments.handheld_mapping.imu_health --require-source '
+                  f'--socket {shlex.quote(socket_path)}; '
                   'exec /usr/bin/python3 -u -m experiments.handheld_mapping.imu_subscriber '
                   f'--socket {shlex.quote(socket_path)}')
         self.command = list(command) if command is not None else [
@@ -190,6 +195,7 @@ class ImuCapture:
             'chip_to_body_expected': self.calibration['chip_to_body'],
             'imu_clock_verified': False, 'orb_fused': False, 'extrinsic_provisional': True,
             'imu_source': 'existing_spi_owner_unix_tee',
+            'recording_device': self.receipt_device,
             'rate_note': 'unique MCU control packets; imu_n may average multiple 208 Hz sensor samples',
             'clock_note': 'MCU t_ms, Pi realtime/monotonic and laptop receipts are distinct clocks; no camera alignment verified',
             'tilt_note': 'accelerometer-only diagnostic; unreliable during motion',
@@ -210,14 +216,31 @@ class ImuCapture:
             self._stderr_reader.start()
             self._reader.start()
             if not self._fresh.wait(timeout):
-                raise TimeoutError('IMU fresh sample timeout')
+                raise TimeoutError(self._startup_timeout_message())
             state = self.snapshot()
             if state['state'] != 'recording':
-                raise RuntimeError(state.get('error', 'IMU failed before fresh sample'))
+                if self._stderr_reader is not None:self._stderr_reader.join(timeout=.2)
+                state=self.snapshot()
+                detail=' / '.join(state.get('stderr_tail',[])[-3:])
+                message=state.get('error','IMU failed before fresh sample')
+                raise RuntimeError(message+(' · '+detail if detail else ''))
         except Exception as error:
             self._fail(str(error))
             self.stop()
             raise
+
+    def _startup_timeout_message(self):
+        state=self.snapshot()
+        if not self._ready:
+            detail='라파 SSH/IMU 수신기가 준비되지 않았습니다. 라파 전원·Wi-Fi·SSH 연결을 확인하세요.'
+        elif not state['recorded']:
+            detail='수신기는 연결됐지만 IMU 데이터가 0건입니다. 터미널 1의 IMU 브리지를 실행 상태로 유지하세요.'
+        elif not state['valid']:
+            detail='브리지 데이터는 오지만 IMU_VALID 신호가 없습니다. STM 전원·SPI·IMU 상태를 확인하세요.'
+        else:
+            detail='새 MCU IMU 표본이 오지 않습니다. t_ms 중복/정지와 STM 상태를 확인하세요.'
+        tail=' / '.join(state.get('stderr_tail',[])[-3:])
+        return 'IMU fresh sample timeout · '+detail+(' · '+tail if tail else '')
 
     def _fail(self, error: str) -> None:
         with self._lock:
@@ -279,6 +302,10 @@ class ImuCapture:
                    'laptop_receipt_realtime_ns': time.time_ns(), 'laptop_receipt_monotonic_ns': now,
                    'imu_clock_verified': False, 'camera_clock_alignment': 'unverified',
                    'segment': self._status['resets']}}
+        if self.receipt_device == 'pi':
+            row['clock'].pop('laptop_receipt_realtime_ns')
+            row['clock'].pop('laptop_receipt_monotonic_ns')
+            row['clock'].update(pi_record_realtime_ns=time.time_ns(), pi_record_monotonic_ns=now)
         self._status['recorded'] += 1
         try:
             drops = event.get('tee_drops', 0)
@@ -426,7 +453,8 @@ class ImuCapture:
                     thread.join(timeout=2.)
             for handle in (self.process.stdin, self.process.stdout, self.process.stderr):
                 if handle is not None:
-                    handle.close()
+                    try:handle.close()
+                    except (BrokenPipeError,OSError):pass
         if self._log is not None:
             self._log.flush()
             self._log.close()

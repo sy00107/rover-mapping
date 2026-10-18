@@ -123,8 +123,8 @@ def classify_surface_points(points, terrain):
     return labels
 
 
-def surface_point_colors(points, labels, terrain):
-    """Colour observed ground slopes relative to gravity without changing semantic labels."""
+def surface_point_colors(points, labels, terrain, smooth_slope_colors=True):
+    """Colour observed slopes, repairing short colour gaps without changing ground data."""
     points = np.asarray(points)
     colors = PALETTE[labels].copy()
     xyz = points @ terrain['grid_from_geometry'][:3,:3].T + terrain['grid_from_geometry'][:3,3]
@@ -135,9 +135,15 @@ def surface_point_colors(points, labels, terrain):
     x = np.floor((xyz[ids,0]-bounds[0])/res).astype(int)
     y = np.floor((xyz[ids,1]-bounds[2])/res).astype(int)
     layers = terrain['layers']
-    slope = np.degrees(np.arctan(np.hypot(layers['reference_ground_gradient_x'][y,x],
-                                        layers['reference_ground_gradient_y'][y,x])))
-    colors[ids[np.isfinite(slope) & (slope >= SLOPE_THRESHOLD_DEG)]] = SLOPE_COLOR
+    if smooth_slope_colors:
+        from experiments.handheld_mapping.slope_display import continuous_slope_mask
+        pink, stats = continuous_slope_mask(terrain, threshold_deg=SLOPE_THRESHOLD_DEG)
+        terrain['slope_display_correction'] = stats
+        colors[ids[pink[y, x]]] = SLOPE_COLOR
+    else:
+        slope = np.degrees(np.arctan(np.hypot(layers['reference_ground_gradient_x'][y,x],
+                                            layers['reference_ground_gradient_y'][y,x])))
+        colors[ids[np.isfinite(slope) & (slope >= SLOPE_THRESHOLD_DEG)]] = SLOPE_COLOR
     return colors
 
 
@@ -169,5 +175,6 @@ def apply_surface_colors(geometry, geometry_path, smooth_obstacles: bool = False
             'unknown': int(counts[UNKNOWN]), 'terrain': terrain['output_dir'],
             'obstacle_smoothing': smoothing,
             'ground_gap_fill': ground_gaps,
+            'slope_display_correction': terrain.get('slope_display_correction'),
             'ground_tolerance_m': terrain['ground_tolerance_m'],
             'obstacle_threshold_m': terrain['obstacle_threshold_m']}

@@ -23,6 +23,17 @@ from typing import Callable
 from experiments.handheld_mapping.protocol import write_packet
 from experiments.handheld_mapping.reconstruct import pose_matrix
 from experiments.handheld_mapping.transport import ByteQueue, FrameBundler
+from experiments.handheld_mapping.capture_integrity import stale_streams
+
+
+def recent_camera_rates(receipts: dict, window: int = 15) -> dict:
+    """Use a recent full window so startup/reconnection delays can age out."""
+    rates = {}
+    for side, values in receipts.items():
+        samples = list(values)[-window:]
+        elapsed = samples[-1]-samples[0] if len(samples) >= window else 0.
+        rates[side] = (len(samples)-1)/elapsed if elapsed > 0 else 0.
+    return rates
 
 
 class CaptureMetrics:
@@ -120,6 +131,29 @@ def depth_parameters(fetch: Callable[[list[str]], list]) -> dict:
     return {'emitter_enabled': 0, 'sensor_depth_units_m': scale}
 
 
+def field_parameter_snapshot(fetch):
+    """Record optional camera settings without inventing defaults for unsupported parameters."""
+    names=['depth_module.enable_auto_exposure','depth_module.exposure','depth_module.gain',
+           'depth_module.emitter_enabled','depth_module.global_time_enabled']
+    result={}
+    for name in names:
+        try:
+            values=fetch([name]);value=values[0] if values else None
+            result[name]=(getattr(value,{1:'bool_value',2:'integer_value',3:'double_value',4:'string_value'}.get(value.type,''),None)
+                          if value is not None else None)
+        except Exception:
+            result[name]=None
+    return result
+
+
+def camera_metadata_record(side,msg):
+    data=msg.json_data
+    if len(data)>32768:raise ValueError('Camera metadata exceeds bounded record size')
+    return dict(kind='camera_metadata',stream=side,
+                stamp_ns=msg.header.stamp.sec*1_000_000_000+msg.header.stamp.nanosec,
+                frame_id=msg.header.frame_id,json_data=data,**receipt_clock())
+
+
 def stop_child(process: subprocess.Popen | None, timeout: float = 35.) -> None:
     if process is None or process.poll() is not None:
         return
@@ -141,6 +175,9 @@ def main() -> None:
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--sensors-only", action="store_true", help="Pi에서는 ORB/Atlas 없이 원본만 전송")
     parser.add_argument("--queue-mib", type=float, default=4.)
+    parser.add_argument("--field-metadata",action="store_true",help="수집용 카메라 원시 metadata와 설정 기록")
+    parser.add_argument('--independent-streams', action='store_true',
+                        help='Pi 로컬 기록: depth 누락과 무관하게 각 원본을 보존')
     args = parser.parse_args()
     if not .25 <= args.queue_mib <= 64:
         raise ValueError("invalid queue MiB limit")
@@ -180,7 +217,8 @@ def main() -> None:
             self.infos = {}
             self.stamps = {side: deque(maxlen=60) for side in ("left", "right", "depth")}
             self.receipt = {side: deque(maxlen=60) for side in self.stamps}
-            self.pending = ByteQueue(max_items=24, max_bytes=int(args.queue_mib*1024*1024))
+            self.pending = ByteQueue(max_items=192 if args.independent_streams else 24,
+                                     max_bytes=int(args.queue_mib*1024*1024))
             self.recording = False
             self.dropped = 0
             self.state = -1
@@ -194,6 +232,14 @@ def main() -> None:
             self.buffer = tf2_ros.Buffer()
             self.listener = tf2_ros.TransformListener(self.buffer, self)
             self.subscriptions_owned = []
+            self.metadata_available=False
+            if getattr(args,'field_metadata',False):
+                try:
+                    from realsense2_camera_msgs.msg import Metadata
+                    self.metadata_available=True
+                    self.capture_metrics.non_image_dropped['camera_metadata']=0
+                except ImportError:
+                    pass
             names = {"left": "infra1", "right": "infra2", "depth": "depth"}
             for side, name in names.items():
                 image_topic = f"/camera/camera/{name}/" + ("image_rect_raw" if side != "depth" else "image_rect_raw")
@@ -202,6 +248,10 @@ def main() -> None:
                 self.subscriptions_owned.append(self.create_subscription(
                     CameraInfo, f"/camera/camera/{name}/camera_info",
                     lambda msg, side=side: self.infos.__setitem__(side, msg), qos_profile_sensor_data))
+                if self.metadata_available:
+                    self.subscriptions_owned.append(self.create_subscription(
+                        Metadata,f"/camera/camera/{name}/metadata",
+                        lambda msg,side=side:self.metadata(side,msg),qos_profile_sensor_data))
             self.subscriptions_owned.append(self.create_subscription(Int32, "/orbslam3/tracking_state", self.tracking, 10))
             self.subscriptions_owned.append(self.create_subscription(PoseStamped, "/orbslam3/camera_pose", self.pose, 10))
             self.subscriptions_owned.append(self.create_subscription(DiagnosticArray, "/orbslam3/diagnostics", self.diagnostics, 10))
@@ -209,9 +259,11 @@ def main() -> None:
         def enqueue(self, header: dict, payload: bytes = b"") -> None:
             if not self.recording:
                 return
-            if header['kind'] == 'image':
+            if header['kind'] == 'image' and not args.independent_streams:
                 self.bundler.push((header, payload))
                 return
+            if header['kind'] == 'image':
+                header['pi_enqueue_monotonic_ns'] = time.monotonic_ns()
             try:
                 self.pending.put_nowait((header, payload))
             except queue.Full:
@@ -264,6 +316,12 @@ def main() -> None:
                 header.update(**clock, stream_seq=self.capture_metrics.image_received(side, stamp, receipt_ns))
             self.enqueue(header, bytes(msg.data))
 
+        def metadata(self,side,msg):
+            if not self.recording:return
+            try:self.enqueue(camera_metadata_record(side,msg))
+            except (ValueError,TypeError):
+                self.capture_metrics.non_image_dropped['camera_metadata']+=1
+
         def tracking(self, msg: Int32) -> None:
             self.state = msg.data
 
@@ -315,7 +373,17 @@ def main() -> None:
                         "-p", "depth_module.infra_profile:=640,480,15", "-p", "depth_module.depth_profile:=640,480,15",
                         "-p", "depth_module.infra1_format:=Y8", "-p", "depth_module.infra2_format:=Y8",
                         "-p", "depth_module.emitter_enabled:=0", "-p", "enable_sync:=true"], "camera.log")
-        wait_until(lambda: len(node.infos) == 3 and min(len(values) for values in node.stamps.values()) >= 20, 30)
+        def camera_ready():
+            return (len(node.infos) == 3 and min(len(values) for values in node.stamps.values()) >= 20
+                    and all(12. <= rate <= 18. for rate in recent_camera_rates(node.receipt).values()))
+        try:
+            wait_until(camera_ready, 30)
+        except RuntimeError as error:
+            if str(error) != '카메라/TF/ORB 준비 시간 초과':
+                raise
+            rates = ', '.join(f'{side} {rate:.1f} FPS' for side, rate in recent_camera_rates(node.receipt).items())
+            raise RuntimeError('카메라 시작 검사 실패 · 안정적인 15 FPS 영상이 오지 않습니다 ('+
+                               rates+'). USB 연결과 camera.log를 확인하세요.') from error
         def info_dict(msg) -> dict:
             return {"width": msg.width, "height": msg.height, "k": list(msg.k), "p": list(msg.p),
                     "r": list(msg.r), "d": list(msg.d), "distortion_model": msg.distortion_model,
@@ -325,10 +393,10 @@ def main() -> None:
         sys.path.insert(0, str(run.parent / "code/helpers"))
         from prepare_mapping_run import calibration_from_probe, prepare_run, sha256
         stats = {}
+        rates = recent_camera_rates(node.receipt)
         for side in ("left", "right"):
-            receipts = node.receipt[side]
             stats[side] = {"encoding": "mono8", "width": 640, "height": 480,
-                           "receipt_rate_hz": (len(receipts)-1)/(receipts[-1]-receipts[0])}
+                           "receipt_rate_hz": rates[side]}
         probe = {"camera_info": {side: info_dict(node.infos[side]) for side in ("left", "right")},
                  "stats": stats, "exact_pair_candidates": len(set(node.stamps["left"]) & set(node.stamps["right"]))}
         calibration = calibration_from_probe(probe, None, "640x480x15:Y8", True)
@@ -347,6 +415,7 @@ def main() -> None:
             wait_until(future.done, 5)
             return future.result().values
         parameters = depth_parameters(fetch_parameters)
+        field_settings=field_parameter_snapshot(fetch_parameters) if args.field_metadata else None
         depth = {**info_dict(node.infos["depth"]), "depth_scale_m": .001,
                  "depth_scale_source": "RealSense ROS fix_depth_scale: Z16 millimetres",
                  "sensor_depth_units_m": parameters['sensor_depth_units_m'], "T_left_depth": left_depth.tolist(),
@@ -359,7 +428,8 @@ def main() -> None:
             prepare_run(prepared, calibration, None)
         send({"kind": "calibration", "source": "D435_Pi", "depth": depth, "stereo": calibration,
               "emitter_enabled": 0, "sensor_profile": "640x480x15",
-              "capture_mode": "sensors_only" if args.sensors_only else "pi_orb"})
+              "capture_mode": "sensors_only" if args.sensors_only else "pi_orb",
+              "field_camera_settings":field_settings,"camera_metadata_subscription":node.metadata_available})
         def transmit() -> None:
             try:
                 while True:
@@ -398,21 +468,20 @@ def main() -> None:
             orb = subprocess.Popen(command, cwd=prepared, stdout=log, stderr=log, start_new_session=True)
             wait_until(lambda: node.state >= 0, 45)
         send({"kind": "ready", "message": "D435 센서 전송 · 종료 후 노트북 ORB" if args.sensors_only else "D435 원본 저장·ORB 촬영 중"})
-        last_frame = time.monotonic()
-        last_status = last_frame
-        previous = node.stamps["left"][-1]
+        last_status = time.monotonic()
         while not stop.is_set():
             rclpy.spin_once(node, timeout_sec=.05)
-            if node.stamps["left"][-1] != previous:
-                previous = node.stamps["left"][-1]
-                last_frame = time.monotonic()
-            if camera.poll() is not None or (orb is not None and orb.poll() is not None) or time.monotonic()-last_frame > 5:
-                raise RuntimeError("카메라/ORB 종료 또는 영상 수신 중단")
+            stale = stale_streams(node.receipt, time.monotonic())
+            if camera.poll() is not None or (orb is not None and orb.poll() is not None):
+                raise RuntimeError("카메라/ORB 종료")
+            if 'left' in stale or 'right' in stale:
+                raise RuntimeError('좌우 카메라 영상 수신 중단: '+', '.join(stale))
             if time.monotonic()-last_status >= 1.:
                 free = shutil.disk_usage('/dev/shm').free
                 if free < 32*1024*1024:
                     raise RuntimeError("Pi RAM disk 여유 부족 — 현재 촬영을 종료합니다")
                 node.enqueue({"kind": "status", "tracking_state": node.state, "dropped": node.dropped,
+                              "stream_warning": '깊이 영상 수신 중단 · 좌우 원본은 계속 기록합니다' if 'depth' in stale else None,
                               "source_frames": node.source_frames, "queue": node.pending.snapshot(),
                               "capture_metrics": node.capture_metrics.snapshot(), "ram_disk_free_bytes": free})
                 last_status = time.monotonic()

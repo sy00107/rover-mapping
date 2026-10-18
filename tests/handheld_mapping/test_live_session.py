@@ -63,7 +63,7 @@ def test_coverage_widget_and_live_option_render_without_camera(tmp_path, monkeyp
         binary.touch()
     app=QApplication.instance() or QApplication([])
     window=MappingWindow(Session(),demo=True)
-    assert window.live_mapping.isChecked() is native_available
+    assert window.point_ready is native_available
     grid=CoverageGrid()
     snapshot=grid.snapshot()
     snapshot.update(tracking_state=2, stale=False,error=None,processed=1,lag_ms=12.,dropped_pairs=0,

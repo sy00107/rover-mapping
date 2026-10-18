@@ -17,9 +17,13 @@ from experiments.handheld_mapping.reconstruct import nearest, pose_matrix, trans
 class SessionImages:
     """Read archived final poses, left images and calibrated depth without changing them."""
 
-    def __init__(self, run: Path, map_id: int = 0, allow_visual_frame: bool = False):
+    def __init__(self, run: Path, map_id: int = 0, allow_visual_frame: bool = False,
+                 feature_depth_max_m: float = 2., enhance_contrast: bool = False):
         self.run = Path(run).resolve()
         self.map_id = map_id
+        if not np.isfinite(feature_depth_max_m) or not .3<feature_depth_max_m<=10:raise ValueError("invalid feature depth range")
+        self.feature_depth_max_m=float(feature_depth_max_m)
+        self.enhance_contrast=bool(enhance_contrast)
         self.calibration = json.loads((self.run/'capture_calibration.json').read_text())
         self.k = np.asarray(self.calibration['stereo']['left']['k']).reshape(3, 3)
         gravity = load_alignment(self.run, 'orb_offline', map_id)
@@ -63,7 +67,7 @@ class SessionImages:
         if image is None or depth is None:
             raise ValueError('missing source image/depth')
         info = self.calibration['depth']
-        depth, _ = spatial_filter(depth, info['depth_scale_m'], DepthFilter(max_depth_m=2.))
+        depth, _ = spatial_filter(depth, info['depth_scale_m'], DepthFilter(max_depth_m=self.feature_depth_max_m))
         # Reproject rectified metric depth to the left camera, including extrinsics.
         dk = np.asarray(info['k']).reshape(3, 3)
         v, u = np.nonzero(depth)
@@ -79,7 +83,10 @@ class SessionImages:
         aligned = np.full(h*w, np.inf)
         np.minimum.at(aligned, pixels[good, 1]*w+pixels[good, 0], xyz[good, 2])
         aligned = aligned.reshape(h, w)
-        keys, descriptors = cv2.SIFT_create(nfeatures=1600, contrastThreshold=.025).detectAndCompute(image, None)
+        if self.enhance_contrast:
+            image=cv2.createCLAHE(clipLimit=2.,tileGridSize=(8,8)).apply(image)
+        keys, descriptors = cv2.SIFT_create(nfeatures=2400 if self.enhance_contrast else 1600,
+            contrastThreshold=.012 if self.enhance_contrast else .025).detectAndCompute(image, None)
         if descriptors is None:
             return np.empty((0, 2)), np.empty((0, 128), np.float32), np.empty((0, 3))
         uv = np.array([key.pt for key in keys])
@@ -209,7 +216,17 @@ def visual_registration(source, target, priors, progress=print, appearance_retri
 def fit_visual_pairs(evidence, source, target, held_ids, candidate_pairs=0):
     """Fit using training views only, then test separately reserved source images."""
     training = [p for p in evidence if p['source_index'] not in held_ids]
-    held = [p for p in evidence if p['source_index'] in held_ids]
+    held_candidates = [p for p in evidence if p['source_index'] in held_ids]
+    # A retrieved source image may have several candidate reference images. Choose
+    # one using its independent image-match strength before fitting, never using
+    # reprojection error under the fitted transform to cherry-pick held-out views.
+    held_by_source={}
+    for pair in held_candidates:
+        key=pair['source_index']
+        score=(pair['inliers'],pair['inliers']/max(pair['matches'],1),-pair['target_index'])
+        previous=held_by_source.get(key)
+        if previous is None or score>previous[0]:held_by_source[key]=(score,pair)
+    held=[held_by_source[key][1] for key in sorted(held_by_source)]
     if not training or len({p['source_index'] for p in held}) < 2:
         raise ValueError('insufficient independent held-out image views')
     # Neither consensus selection nor its initial transform uses held-out images.
@@ -250,11 +267,15 @@ def fit_visual_pairs(evidence, source, target, held_ids, candidate_pairs=0):
               'method': 'mutual_RootSIFT_metric_depth_PnP_multiview_reprojection',
               'source_frame':'gravity' if gravity_available else 'slam',
               'source_map_id':getattr(source,'map_id',0),
+              'reference_map_id':getattr(target,'map_id',0),
+              'feature_preprocessing':'CLAHE_RootSIFT' if getattr(source,'enhance_contrast',False) else 'RootSIFT',
+              'feature_depth_max_m':getattr(source,'feature_depth_max_m',2.),
               'source_to_reference':result.tolist(),
               'candidate_image_pairs': candidate_pairs, 'matched_pairs': len(evidence),
               'consensus_pairs': len(support), 'distinct_source_views': len(unique),
               'held_out_source_views': sorted({p['source_index'] for p in held}),
               'held_out_image_pairs': len(held), 'held_out_used_for_consensus_or_fit': False,
+              'held_out_target_selection':'highest independent PnP inlier count per source image before fitting',
               'camera_support_span_m': span,
               'train_reprojection_p50_p90_px': np.percentile(train_errors, [50, 90]).tolist(),
               'held_out_reprojection_p50_p90_px': np.percentile(held_errors, [50, 90]).tolist(),

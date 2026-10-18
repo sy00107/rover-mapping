@@ -36,3 +36,12 @@ def test_available_sensor_depth_units_are_metadata():
         return ([SimpleNamespace(type=2, integer_value=0)] if 'emitter' in names[0]
                 else [SimpleNamespace(type=3, double_value=.001)])
     assert depth_parameters(fetch)['sensor_depth_units_m'] == .001
+
+
+def test_startup_rate_uses_recent_window_without_hiding_sustained_slow_camera():
+    from experiments.handheld_mapping.pi_worker import recent_camera_rates
+    # An initial USB restart gap expires only after a whole healthy window.
+    values=[0.,.066,3.]+[4.+i/15 for i in range(15)]
+    assert recent_camera_rates({'left':values})['left']==pytest.approx(15.)
+    assert recent_camera_rates({'left':[i/5 for i in range(20)]})['left']==pytest.approx(5.)
+    assert recent_camera_rates({'left':[0.,.1]})['left']==0.

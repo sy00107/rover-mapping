@@ -61,8 +61,8 @@ def test_close_while_recording_waits_for_save(tmp_path):
     assert session.snapshot()["state"] == "complete", session.snapshot()
 
 
-def test_fusion_checkbox_requires_imu_recording_and_is_opt_in(tmp_path, monkeypatch):
-    from PyQt5.QtWidgets import QApplication
+def test_capture_policy_always_records_imu_and_settings_start_collapsed(tmp_path, monkeypatch):
+    from PyQt5.QtWidgets import QApplication, QCheckBox
     from experiments.handheld_mapping.app import MappingWindow
     from experiments.handheld_mapping.controller import Session
     app = QApplication.instance() or QApplication([])
@@ -71,27 +71,26 @@ def test_fusion_checkbox_requires_imu_recording_and_is_opt_in(tmp_path, monkeypa
     monkeypatch.setattr(session, "start", settings.append)
     window = MappingWindow(session, output_root=tmp_path)
     try:
-        assert not window.inertial_fusion.isChecked()
-        window.imu_enabled.setChecked(False)
-        window.inertial_fusion.setChecked(True)
-        assert window.imu_enabled.isChecked()
-        window.start()
-        assert settings[-1]["inertial_fusion"] is True
-        assert settings[-1]["imu_enabled"] is True
-        session.update(state="processing")
-        window.refresh()
-        assert not window.inertial_fusion.isEnabled()
-        session.update(state="idle")
-        window.refresh()
-        window.imu_enabled.setChecked(False)
-        assert not window.inertial_fusion.isChecked()
-        window.inertial_fusion.setChecked(True)
-        window.demo.setChecked(True)
-        window.refresh()
-        assert not window.inertial_fusion.isChecked()
-        assert not window.inertial_fusion.isEnabled()
+        window.show()
         app.processEvents()
+        assert not window.settings_panel.isVisible()
+        assert not any(box.isVisible() for box in window.findChildren(QCheckBox))
+        window.start()
+        assert settings[-1]["imu_enabled"] is True
+        assert settings[-1]["gravity_enabled"] is True
+        assert settings[-1]["sensors_only"] is True
+        assert settings[-1]["compare_lines"] is False
+        assert settings[-1]["inertial_fusion"] is False
+        window.settings_button.click()
+        assert window.settings_panel.isVisible()
+        session.update(state="recording")
+        window.refresh()
+        assert not window.imu_calibration.isEnabled()
+        assert not window.host.isEnabled()
+        window.settings_button.click()
+        assert not window.settings_panel.isVisible()
     finally:
+        session.update(state="idle")
         window.close()
 
 
@@ -119,8 +118,8 @@ def test_window_fusion_argument_enables_imu_recording(tmp_path):
     app = QApplication.instance() or QApplication([])
     window = MappingWindow(Session(), output_root=tmp_path, inertial_fusion=True)
     try:
-        assert window.inertial_fusion.isChecked()
-        assert window.imu_enabled.isChecked()
+        assert window.inertial_fusion is True
+        assert window.demo is False
         app.processEvents()
     finally:
         window.close()

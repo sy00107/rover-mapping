@@ -29,8 +29,17 @@ def decode_image(header: dict, payload: bytes) -> np.ndarray:
     if not (0 < width <= 4096 and 0 < height <= 2160 and width * pixel <= step <= width * pixel + 4096):
         raise ValueError("invalid image dimensions/stride")
     size = height * step
-    if size > 32 * 1024 * 1024 or header.get("compression") != "zlib":
+    if size > 32 * 1024 * 1024:
         raise ValueError("invalid image size/compression")
+    if header.get('compression') == 'jpeg' and header.get('preview') is True and encoding == 'mono8':
+        if len(payload) > size*4:
+            raise ValueError('oversized preview JPEG')
+        image = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_GRAYSCALE)
+        if image is None or image.shape != (height, width):
+            raise ValueError('invalid preview JPEG')
+        return image
+    if header.get('compression') != 'zlib':
+        raise ValueError('invalid image size/compression')
     decoder = zlib.decompressobj()
     raw = decoder.decompress(payload, size + 1)
     if len(raw) != size or not decoder.eof or decoder.unused_data:
@@ -43,14 +52,40 @@ def decode_image(header: dict, payload: bytes) -> np.ndarray:
 class RunWriter:
     """노트북 원본과 최종 ORB 산출물을 기록하고 경로·checksum을 검증한다."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, resume: bool = False) -> None:
         self.path = Path(path)
-        self.path.mkdir(parents=True, exist_ok=False)
-        (self.path / "orb").mkdir()
-        self.index = (self.path / "frames.jsonl").open("w", buffering=1)
-        self.events = (self.path / "events.jsonl").open("w", buffering=1)
+        self.path.mkdir(parents=True, exist_ok=resume)
+        (self.path / "orb").mkdir(exist_ok=resume)
+        self.resuming = resume
         self.counts = {key: 0 for key in ("left", "right", "depth")}
         self.last_stamp: dict[str, int] = {}
+        self.saved_stamps = {side: set() for side in self.counts}
+        if resume and (self.path/'frames.jsonl').exists():
+            with (self.path/'frames.jsonl').open('r+b') as stream:
+                while True:
+                    position = stream.tell()
+                    line = stream.readline()
+                    if not line:
+                        break
+                    try:
+                        if not line.endswith(b'\n'):
+                            raise ValueError('unfinished index row')
+                        row = json.loads(line)
+                    except (ValueError, UnicodeDecodeError):
+                        if stream.read(1):
+                            raise ValueError('corrupt interior frame index')
+                        stream.truncate(position)
+                        break
+                    side, stamp = row['stream'], row['stamp_ns']
+                    if (side not in self.counts or not isinstance(stamp, int)
+                            or stamp <= self.last_stamp.get(side, -1)
+                            or row['path'] != f'raw/{side}/{stamp}.png'):
+                        raise ValueError('invalid saved frame index')
+                    self.saved_stamps[side].add(stamp)
+                    self.last_stamp[side] = stamp
+                    self.counts[side] += 1
+        self.index = (self.path / "frames.jsonl").open("a" if resume else "w", buffering=1)
+        self.events = (self.path / "events.jsonl").open("a" if resume else "w", buffering=1)
         self.image_timings = {side: {"images": 0, "decode_ms_total": 0., "decode_ms_max": 0.,
                                     "png_write_ms_total": 0., "png_write_ms_max": 0.}
                               for side in self.counts}
@@ -59,7 +94,9 @@ class RunWriter:
         kind = header["kind"]
         if kind == "image":
             side, stamp = header["stream"], header["stamp_ns"]
-            if side not in self.counts or not isinstance(stamp, int) or stamp <= self.last_stamp.get(side, -1):
+            duplicate = self.resuming and side in self.saved_stamps and stamp in self.saved_stamps[side]
+            if (side not in self.counts or not isinstance(stamp, int)
+                    or (stamp <= self.last_stamp.get(side, -1) and not duplicate)):
                 raise ValueError("invalid/non-increasing image stream or stamp")
             decode_start = time.monotonic_ns()
             image = decode_image(header, payload)
@@ -69,6 +106,13 @@ class RunWriter:
             relative = f"raw/{side}/{stamp}.png"
             target = self.path / relative
             target.parent.mkdir(parents=True, exist_ok=True)
+            if duplicate:
+                saved = cv2.imread(str(target), cv2.IMREAD_UNCHANGED) if target.exists() else None
+                if saved is not None and not np.array_equal(saved, image):
+                    raise ValueError('재개할 영상이 검증된 Pi 원본과 다릅니다')
+                if saved is None and not cv2.imwrite(str(target), image, [cv2.IMWRITE_PNG_COMPRESSION, 1]):
+                    raise OSError('중단된 원본 영상 복구 실패')
+                return None
             png_start = time.monotonic_ns()
             if not cv2.imwrite(str(target), image, [cv2.IMWRITE_PNG_COMPRESSION, 1]):
                 raise OSError("원본 영상 저장 실패")
@@ -88,6 +132,13 @@ class RunWriter:
         if kind == "calibration":
             target = self.path / "capture_calibration.json"
             if target.exists():
+                if self.resuming:
+                    def authoritative(data):
+                        return {k: v for k, v in data.items()
+                                if not k.startswith('laptop_') and k != 'delivery_mode'}
+                    if authoritative(json.loads(target.read_text())) != authoritative(header):
+                        raise ValueError('재개할 카메라 보정값이 Pi 원본과 다릅니다')
+                    return None
                 raise ValueError("calibration changed during capture")
             atomic_json(target, header)
         elif kind == "artifact":
@@ -98,6 +149,8 @@ class RunWriter:
                 raise ValueError("artifact checksum mismatch")
             target = self.path / "orb" / name
             if target.exists():
+                if self.resuming and hashlib.sha256(target.read_bytes()).hexdigest() == header.get('sha256'):
+                    return None
                 raise ValueError("duplicate artifact")
             temporary = target.with_suffix(target.suffix + ".tmp")
             temporary.write_bytes(payload)

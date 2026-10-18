@@ -27,7 +27,7 @@ class FakeNode:
         return None
 
 
-def capture_node() -> object:
+def capture_node(independent_streams=False) -> object:
     assert hasattr(pi_worker, 'CaptureMetrics'), 'recording-only CaptureMetrics is missing'
     source = Path(pi_worker.__file__).read_text()
     definition = next(node for node in ast.walk(ast.parse(source))
@@ -35,7 +35,7 @@ def capture_node() -> object:
     namespace = {'Node': FakeNode, 'deque': deque, 'ByteQueue': ByteQueue, 'FrameBundler': FrameBundler,
                  'CaptureMetrics': pi_worker.CaptureMetrics, 'queue': queue,
                  'receipt_clock': pi_worker.receipt_clock,
-                 'time': pi_worker.time, 'args': SimpleNamespace(queue_mib=4.),
+                 'time': pi_worker.time, 'args': SimpleNamespace(queue_mib=4., independent_streams=independent_streams),
                  'stop': threading.Event(), 'qos_profile_sensor_data': object(),
                  'tf2_ros': SimpleNamespace(Buffer=lambda: None, TransformListener=lambda *args: None),
                  **{name: SimpleNamespace for name in
@@ -94,6 +94,20 @@ def test_camera_clock_pair_preserves_domains_and_records_sampling_uncertainty(mo
     assert pi_worker.receipt_clock() == {'pi_receipt_monotonic_ns': 1100,
         'pi_receipt_realtime_ns': 200000, 'pi_receipt_monotonic_raw_ns': 7000,
         'pi_clock_sample_span_ns': 200}
+
+
+def test_local_capture_enqueues_stereo_without_depth_and_keeps_unpaired_raw():
+    node = capture_node(independent_streams=True)
+    node.recording = True
+    for side in ('left', 'right'):
+        node.image(side, image_message(1, side))
+    node.image('left', image_message(2))
+    node.pending.finish()
+    headers = [node.pending.get()[0] for _ in range(3)]
+    assert [(h['stream'], h['stamp_ns']) for h in headers] == [('left',1),('right',1),('left',2)]
+    assert node.pending.get() is None
+    assert all('pi_enqueue_monotonic_ns' in h for h in headers)
+    assert node.capture_metrics.snapshot()['streams']['left']['enqueued'] == 2
 
 
 def test_image_drops_are_separate_from_pose_and_status_drops() -> None:
