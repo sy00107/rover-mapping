@@ -32,7 +32,7 @@ int main(int argc,char**argv) {
  std::ofstream raw(output+"/rtab_odometry_raw.tum");
  std::ifstream input(argv[1]); if(!input) return 2;
  std::ofstream timings(output+"/timings.csv"); timings<<"stamp,tracking_ok,odom_ms,slam_ms,inliers,matches,covariance_linear,covariance_angular\n";
- std::map<int,double> stamps; std::string line; int n=0,failed=0; int limit=std::stoi(argv[8]);
+ std::string line; int n=0,failed=0; int limit=std::stoi(argv[8]);
  while(std::getline(input,line) && (!limit || n<limit)) {
   std::istringstream ss(line);std::string stamp,left,right;std::getline(ss,stamp,'\t');std::getline(ss,left,'\t');std::getline(ss,right);
   double t=std::stoll(stamp)/1e9; ++n;
@@ -47,7 +47,7 @@ int main(int argc,char**argv) {
   } else data=SensorData(l,r,model,n,t);
   OdometryInfo info;
   auto a=std::chrono::steady_clock::now(); Transform pose=odom->process(data,&info); auto b=std::chrono::steady_clock::now();
-  if(!pose.isNull()){slam.process(data,pose,info.reg.covariance.empty() ? cv::Mat::eye(6,6,CV_64FC1) : info.reg.covariance);stamps[n]=t;
+  if(!pose.isNull()){slam.process(data,pose,info.reg.covariance.empty() ? cv::Mat::eye(6,6,CV_64FC1) : info.reg.covariance);
    auto q=pose.getQuaterniond();raw<<std::setprecision(17)<<t<<' '<<pose.x()<<' '<<pose.y()<<' '<<pose.z()<<' '<<q.x()<<' '<<q.y()<<' '<<q.z()<<' '<<q.w()<<'\n';
   } else ++failed;
   auto c=std::chrono::steady_clock::now();
@@ -55,8 +55,19 @@ int main(int argc,char**argv) {
   if(n%100==0) std::cout<<n<<" frames; lost="<<failed<<std::endl;
  }
  std::map<int,Transform> poses;std::multimap<int,Link> links;
- slam.getGraph(poses,links,true,true);
- std::map<int,double> used; for(auto &v:poses) if(v.first>0) used[v.first]=stamps.at(v.first);
+ // RTAB-Map generates node IDs independently of input frame IDs, particularly
+ // after tracking failures. Export the timestamp stored by each graph node.
+ std::map<int,Signature> signatures;
+ slam.getGraph(poses,links,true,true,&signatures,false,false,false,false,false,false);
+ std::map<int,double> used;
+ for(const auto &v:poses) if(v.first>0) {
+  auto signature=signatures.find(v.first);
+  if(signature==signatures.end() || signature->second.getStamp()<=0) {
+   std::cerr<<"Missing timestamp for graph node "<<v.first<<std::endl;
+   slam.close();return 4;
+  }
+  used[v.first]=signature->second.getStamp();
+ }
  if(!graph::exportPoses(output+"/rtab_optimized.tum",10,poses,links,used)) return 4;
  slam.close();
  std::ofstream summary(output+"/runner_summary.json");summary<<"{\"frames\":"<<n<<",\"lost\":"<<failed<<",\"nodes\":"<<poses.size()<<",\"features\":\"GFTT+BRIEF\",\"input\":\""<<(rgbd?"left IR + measured depth; optical frame; no IMU":"rectified stereo IR; optical frame; no IMU")<<"\"}\n";

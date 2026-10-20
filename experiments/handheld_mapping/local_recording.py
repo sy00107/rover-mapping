@@ -10,6 +10,8 @@ import hashlib
 import io
 import json
 import os
+import select
+import signal
 from pathlib import Path
 import subprocess
 import sys
@@ -23,6 +25,88 @@ from .capture_integrity import CaptureIntegrity
 from .recording_recovery import owner_alive, process_identity, recover_abandoned
 
 RECORDINGS = Path('/home/pi/handheld_mapping/recordings')
+
+
+class RecorderShutdown:
+    """Enforce stop deadlines independently of packet reads and device callbacks."""
+    def __init__(self, process, stop_path, grace=20., signal_grace=3.):
+        self.process, self.stop_path = process, stop_path
+        self.grace, self.signal_grace = grace, signal_grace
+        self.requested = threading.Event()
+        self.closed = threading.Event()
+        self.exhausted = threading.Event()
+        self.forced = False
+        self.children = {}
+        identity = process_identity(process.pid)
+        if identity:
+            self.children[process.pid] = identity
+        self.thread = threading.Thread(target=self.watch, daemon=True)
+        self.thread.start()
+
+    def discover(self):
+        # Camera processes start their own sessions, so the worker group alone
+        # is insufficient. Retain start times even after a parent has exited.
+        pending = list(self.children.values())
+        seen = set()
+        while pending:
+            parent = pending.pop()
+            pid = parent['pid']
+            if pid in seen or not owner_alive(parent):
+                continue
+            seen.add(pid)
+            try:
+                children = Path(f'/proc/{pid}/task/{pid}/children').read_text().split()
+            except OSError:
+                continue
+            for child_pid in children:
+                child = process_identity(int(child_pid))
+                if child:
+                    self.children[child['pid']] = child
+                    pending.append(child)
+
+    def watch(self):
+        started = None
+        stage = 0
+        while not self.closed.wait(.1):
+            self.discover()
+            if started is None:
+                if not (self.requested.is_set() or self.stop_path.exists()):
+                    continue
+                started = time.monotonic()
+                try:
+                    os.set_blocking(self.process.stdin.fileno(), False)
+                    self.process.stdin.write(b'stop\n')
+                except (BrokenPipeError, OSError):
+                    pass
+            elapsed = time.monotonic()-started
+            signals = (signal.SIGINT, signal.SIGTERM, signal.SIGKILL)
+            if stage < len(signals) and elapsed >= self.grace+stage*self.signal_grace:
+                for child in list(self.children.values()):
+                    if owner_alive(child):
+                        try:
+                            os.kill(child['pid'], signals[stage])
+                            self.forced = True
+                        except ProcessLookupError:
+                            pass
+                stage += 1
+            if elapsed >= self.grace+3*self.signal_grace:
+                self.exhausted.set()
+
+    def read(self, size):
+        while not self.exhausted.is_set():
+            if select.select([self.process.stdout], [], [], .1)[0]:
+                return os.read(self.process.stdout.fileno(), size)
+        raise TimeoutError('Pi 기록 종료 제한 시간 초과')
+
+    def close(self):
+        self.requested.set()
+        while not self.exhausted.is_set():
+            self.process.poll()  # Reap the direct worker, including normal exits.
+            if not any(owner_alive(c) for c in list(self.children.values())):
+                break
+            self.exhausted.wait(.1)
+        self.closed.set()
+        self.thread.join(timeout=1)
 
 
 def run_path(run_id):
@@ -203,7 +287,7 @@ def _record(path, worker_command=None, imu_command=None, min_free=512_000_000):
         atomic_json(path/'done.json', {'error': '다른 Pi 로컬 촬영이 실행 중입니다', 'files': []})
         return
     preview = Preview(path)
-    process = imu = None
+    process = imu = shutdown = None
     errors = []
     stop_monitor = threading.Event()
     counts = {s: 0 for s in ('left', 'right', 'depth')}
@@ -253,16 +337,11 @@ def _record(path, worker_command=None, imu_command=None, min_free=512_000_000):
                     capture=source_status, preview_error=preview.error, recording=True,
                     imu_degraded=imu_degraded))
                 if (path/'stop').exists() and process and process.poll() is None:
-                    try:
-                        process.stdin.write(b'stop\n')
-                        process.stdin.flush()
-                    except (BrokenPipeError, OSError):
-                        pass
-                    return
+                    shutdown.requested.set()
             except Exception as error:
                 errors.append(str(error))
-                if process and process.poll() is None:
-                    process.terminate()
+                if shutdown:
+                    shutdown.requested.set()
                 return
     monitor_thread = None
     try:
@@ -285,13 +364,14 @@ def _record(path, worker_command=None, imu_command=None, min_free=512_000_000):
             command += ['--field-metadata']
         process = subprocess.Popen(command, cwd=code, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=log, start_new_session=True, bufsize=0)
+        shutdown = RecorderShutdown(process, path/'stop')
         atomic_json(path/'children.json', [identity for child in (process, imu.process if imu else None)
                     if child and (identity := process_identity(child.pid)) is not None])
         monitor_thread = threading.Thread(target=monitor, daemon=True)
         monitor_thread.start()
         with (path/'capture.bin').open('xb') as archive:
             while True:
-                packet = read_packet(process.stdout)
+                packet = read_packet(shutdown)
                 if packet is None:
                     break
                 header, payload = packet
@@ -325,13 +405,11 @@ def _record(path, worker_command=None, imu_command=None, min_free=512_000_000):
         stop_monitor.set()
         if monitor_thread:
             monitor_thread.join(timeout=3)
+        if shutdown:
+            shutdown.close()
+            if shutdown.forced:
+                errors.append('Pi 기록 종료 시간 초과 · 강제 종료 후 저장된 원본 보존')
         if process:
-            if process.poll() is None:
-                from .pi_worker import stop_child
-                try:
-                    stop_child(process, 15)
-                except Exception as error:
-                    errors.append(str(error))
             process.stdin.close()
             process.stdout.close()
         atomic_json(path/'capture_stopped.json', dict(counts=counts, pi_monotonic_ns=time.monotonic_ns()))
@@ -364,7 +442,9 @@ def _record(path, worker_command=None, imu_command=None, min_free=512_000_000):
                     os.fsync(stream.fileno())
                 files.append(dict(name=str(f.relative_to(path)), size=f.stat().st_size, sha256=digest(f)))
         quality = integrity.result()
-        quality.update(imu_degraded=imu_degraded, partial=quality['partial'] or imu_degraded)
+        interrupted = bool(errors) or bool(shutdown and shutdown.forced)
+        quality.update(imu_degraded=imu_degraded, interrupted=interrupted,
+                       partial=quality['partial'] or imu_degraded or interrupted)
         atomic_json(path/'done.json', dict(files=files, counts=counts, finished=final, quality=quality,
                     imu_required=bool(config.get('imu_enabled')),
                     error=capture_failure_reason(errors, diagnostics), remote_path=str(path)))

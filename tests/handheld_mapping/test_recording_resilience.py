@@ -41,6 +41,64 @@ def cleanup(process, path):
     process.stderr.close()
 
 
+@pytest.mark.parametrize('failure', ['streaming', 'blocked_packet', 'camera_child'])
+def test_stop_deadline_finalizes_unresponsive_worker_and_releases_camera(tmp_path, failure):
+    from experiments.handheld_mapping.recording_recovery import owner_alive, scan_capture
+    path = tmp_path/'stuck'
+    path.mkdir()
+    (path/'config.json').write_text('{"imu_enabled":false}')
+    # Ignore all cooperative stop paths. A camera may own a separate session and
+    # keep stdout open after its worker dies.
+    prelude = '''import signal
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+'''
+    script = sensor_script().replace(
+        'while not select.select([sys.stdin],[],[],0)[0]:', 'while True:')
+    if failure == 'blocked_packet':
+        script = script.replace('n=0',
+            'out.write(b"\\x00");out.flush()\nwhile True: time.sleep(.1)\nn=0')
+    if failure == 'camera_child':
+        script = script.replace('n=0', '''import subprocess,os
+from experiments.handheld_mapping.recording_recovery import process_identity
+child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],start_new_session=True)
+open(CHILD_PATH,'w').write(json.dumps(process_identity(child.pid)))
+n=0'''.replace('CHILD_PATH', repr(str(path/'camera_identity.json'))))
+    command = [sys.executable, '-u', '-c', prelude+script]
+    code = ('import functools;from experiments.handheld_mapping import local_recording as lr;'
+            'lr.RecorderShutdown=functools.partial(lr.RecorderShutdown,grace=.5,signal_grace=.2);'
+            f'lr.record({str(path)!r},worker_command={command!r},min_free=1)')
+    process = subprocess.Popen([sys.executable, '-u', '-c', code], stderr=subprocess.PIPE)
+    try:
+        until(lambda:(path/'ready').exists())
+        if failure == 'camera_child':
+            until(lambda:(path/'camera_identity.json').exists())
+        (path/'stop').touch()
+        process.wait(timeout=8)
+        assert process.returncode == 0, process.stderr.read().decode()
+        done = json.loads((path/'done.json').read_text())
+        assert done['error'] and done['quality']['partial'] and done['quality']['interrupted']
+        assert (path/'capture_stopped.json').exists()
+        scan = scan_capture(path/'capture.bin')
+        assert scan['calibration'] and scan['valid_bytes'] == (path/'capture.bin').stat().st_size
+        assert scan['quality']['counts'] == done['counts']
+        for entry in done['files']:
+            assert digest(path/entry['name']) == entry['sha256']
+        assert not any(owner_alive(c) for c in json.loads((path/'children.json').read_text()))
+        if failure == 'camera_child':
+            assert not owner_alive(json.loads((path/'camera_identity.json').read_text()))
+        # A fresh recorder can acquire the camera lock after forced shutdown.
+        following = tmp_path/'next'
+        next_process = recorder(following)
+        try:
+            until(lambda:(following/'ready').exists())
+        finally:
+            cleanup(next_process, following)
+        assert json.loads((following/'done.json').read_text())['error'] is None
+    finally:
+        cleanup(process, path)
+
+
 def test_imu_pause_keeps_camera_recording_and_marks_quality(tmp_path):
     imu_script = '''import sys,time,json,select
 print(json.dumps(dict(kind='ready',chip_to_body=AXES)),flush=True)

@@ -83,12 +83,27 @@ PYTHONNOUSERSITE=1 .venv-mapping/bin/python -m experiments.handheld_mapping.loca
 로컬 stop 클릭만으로 '촬영 종료·전송 중'으로 바꾸지 않는다. 원격 종료는
 capture_stopped 또는 마감 manifest로 확인한다.
 
+Pi recorder는 출력 읽기와 별도의 감시 스레드에서 stop 파일을 확인한다.
+요청을 감지하면 worker에 `stop`을 한 번 보내고, 20초 안에 종료하지 않으면
+SIGINT → 3초 후 SIGTERM → 3초 후 SIGKILL을 적용한다. worker와 별도 세션으로
+실행된 카메라 자식도 추적하며, PID와 시작 시각이 같은 프로세스만 종료한다.
+추가 3초 뒤에도 출력 파이프가 열려 있으면 읽기 대기를 중단한다.
+종료 대기 중에도 상태·용량 감시는 계속한다. 강제 종료는 오류와 partial 상태로
+마감하며, 이미 읽은 완전한 packet과 원본 파일·체크섬을 보존한다.
+실제 카메라가 정상 종료에 필요한 시간은 Pi에서 추가 확인해야 한다.
+
 앱의 '전송 보류 · 나중에 이어받기'는 원본과 checkpoint를 보존한다. 전송/종료 대기 중
 창 닫기도 보류 경로를 사용한다. 장기 응답/종료 대기는 기본 75초 후 보류하며, 미확인
 원격 촬영을 종료 성공으로 표시하지 않는다. 종료 확인 전 보류라면 Pi가 계속 촬영 중일 수 있음을 표시한다.
 
 ## 검증
 
+- 종료 제한 시간 보강: 종료·복구 관련 **27 passed**. 종료 요청·SIGINT·SIGTERM을
+  무시하는 연속 출력, 미완성 packet에서 멈춘 출력, 별도 세션 카메라 자식 잔존을
+  실제 subprocess로 검증했다. 원본 체크섬과 다음 촬영의 lock 획득도 확인했다.
+- 보강 후 전체 검사: **604 passed, 9 skipped**, Unix 소켓 권한 제한으로 4건 실패.
+  해당 IMU 테스트 파일을 샌드박스 밖에서 재검사해 **25 passed, 1 skipped**로
+  실패 4건이 모두 통과함을 확인했다.
 - 전체 handheld 회귀: **522 passed, 9 skipped (67.78초)**.
 - 새 회귀는 실제 로컬 subprocess로 IMU 일시 정지/시작 실패, 오류 후 영상 회수,
   recorder 강제 종료와 손상 tail, IMU JSONL tail, 다운로드 및 PNG import 재개,
